@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,11 @@ static uint16_t bf16(float x) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(_WIN32)
+    _putenv_s("STRATA_HC_PERSIST", "1");   // the existing opt-in persistent read (another summation order): timed and diffed below
+#else
+    setenv("STRATA_HC_PERSIST", "1", 1);
+#endif
     const int iters = argc > 1 ? std::atoi(argv[1]) : 400;
     const int sets = argc > 2 ? std::max(1, std::atoi(argv[2])) : 16;
     const int t_lo = argc > 3 ? std::atoi(argv[3]) : 1, t_hi = argc > 4 ? std::atoi(argv[4]) : 8;
@@ -68,7 +74,8 @@ int main(int argc, char** argv) {
     CK(cudaStreamCreate(&s));
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    if (std::getenv("HC_BENCH_NOCHECK") == nullptr) K::fused_gr_check();   // the card's default variant, as the engine does (HC_BENCH_NOCHECK=1: skip, so a profiler sees the arms first)
+    if (std::getenv("HC_BENCH_NOCHECK") == nullptr) K::fused_gr_check();
+    K::fused_gr_persist_init();   // prints whether it runs here and its check against the default read   // the card's default variant, as the engine does (HC_BENCH_NOCHECK=1: skip, so a profiler sees the arms first)
     struct Arm { const char* name; int variant, wpb, pd, rpw; };
     const Arm arms[] = {{"plain", 1, -1, -1, -1}, {"staged", 3, -1, -1, -1}, {"w8r1p2", 4, 8, 2, 1}, {"w8r2p1", 4, 8, 1, 2},
                         {"w8r2p2", 4, 8, 2, 2}, {"w4r2p1", 4, 4, 1, 2}, {"w4r2p2", 4, 4, 2, 2}};
@@ -121,6 +128,28 @@ int main(int argc, char** argv) {
                 }
             }
     std::printf("bitwise: %d failures over T %d..%d x apply x inplace x %d arms\n", failures, t_lo, t_hi, NA - 1);
+    // the persistent read (STRATA_HC_PERSIST, not bitwise): max relative difference against plain, and its cold time
+    for (int T = t_lo; T <= t_hi; ++T) {
+        build(T, 1, true);
+        std::vector<float> ref, out;
+        CK(cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice));
+        K::fused_gr_read_multi_variant(as.data(), T, dxn, s, 1);
+        CK(cudaStreamSynchronize(s)); snapshot(T, ref);
+        CK(cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice));
+        const bool ran = K::fused_gr_read_persist(as.data(), T, s);
+        CK(cudaStreamSynchronize(s));
+        if (!ran) { std::printf("PERSIST T %d: not run\n", T); continue; }
+        snapshot(T, out);
+        double mref = 0, md = 0, sq = 0, sqr = 0;
+        for (size_t i = 0; i < ref.size(); ++i) { mref = std::max(mref, (double) std::fabs(ref[i])); md = std::max(md, (double) std::fabs(out[i] - ref[i])); sq += (double) (out[i] - ref[i]) * (out[i] - ref[i]); sqr += (double) ref[i] * ref[i]; }
+        for (int rep = 0; rep < 2; ++rep) { for (int i = 0; i < iters; ++i) K::fused_gr_read_persist(&as[(size_t) (i % sets) * TM], T, s); CK(cudaStreamSynchronize(s)); }
+        CK(cudaEventRecord(e0, s));
+        for (int i = 0; i < iters; ++i) K::fused_gr_read_persist(&as[(size_t) (i % sets) * TM], T, s);
+        CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
+        float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+        const double us = 1e3 * ms / iters;
+        std::printf("PERSIST T %d read %6.2f us (%5.0f GB/s) | max rel diff %.3g, rel rms %.3g vs plain\n", T, us, 13.230080e6 / (us * 1e3), md / mref, std::sqrt(sq / sqr));
+    }
     // 2) cold timing, apply on, R in place (the engine's case), weights rotating over `sets` copies
     for (int T = t_lo; T <= t_hi; ++T) {
         build(T, 1, true);
