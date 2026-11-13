@@ -1,0 +1,24 @@
+{
+  "repository": "Niko1221/Strata",
+  "engine_version": "0.1.56",
+  "base_commit": "06698c674673008395ba6e971580538d6b1ea6e0",
+  "base_kind": "BUILD commit reported by the official engine 0.1.56 CUDA 13 package",
+  "release_tag": "v0.2.10",
+  "release_tag_commit": "ffa80d73133ea5c548aefe57889a16e8085a938f",
+  "tag_relation": "base_commit is an ancestor of release_tag, 69 commits earlier. In that range the engine sources change only under src/dsv41 (the separate strata-dsv41 executable), src/split (built by its own src/split/CMakeLists.txt, which the root CMakeLists.txt does not reference), metal/ (the Metal build) and third_party/antirez-ds4; the CUDA strata target's sources are identical",
+  "ggml_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "reviewed_upstream": {
+    "ref": "main",
+    "commit": "13eedf552417a6a791a7d13c6597e24300ee3a09",
+    "latest_tag": "v0.2.13.1",
+    "reviewed_on": "2026-11-13"
+  },
+  "next_candidate": {
+    "engine_version": "0.1.59",
+    "build_commit": "712fec6b4297c9cfd32ab43daaa2979a9aa01edf",
+    "build_commit_source": "release feed strata-feed.json: build_id 712fec6b4297+cuda13.0 of the windows-x86_64 cuda13 engine package",
+    "release_tag": "v0.2.13",
+    "release_tag_commit": "d2f096475817d4666c364c820b0ca830f751cfc5",
+    "status": "rehearsal: the PCIe share patch replays without conflicts; not built or measured"
+  }
+}
