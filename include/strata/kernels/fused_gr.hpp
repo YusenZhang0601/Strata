@@ -93,6 +93,12 @@ void fused_gr_v3_print_resources();
 /// plain read unless STRATA_HC_SPLIT=1 or 2 names a variant.
 void fused_gr_check();
 int fused_gr_variant();
+/// personal fork (STRATA_HC_DEEP, 2026-11-13), the bench only: the multi read as `variant` (1 plain, 2 split, 3 staged, 4 deep;
+/// bf16 weights, no q8_1 image, at most kFusedGrMaxT tokens), and the deep read's shape (wpb 8 / 4 warps a block, pd 1 / 2 tiles
+/// ahead, rpw 1 / 2 down rows a warp; -1 = STRATA_HC_DEEP_WPB / _PD / _RPW).
+void fused_gr_read_multi_variant(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, int variant,
+                                 unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+void fused_gr_deep_shape(int wpb, int pd, int rpw);
 
 /// Opt-in STRATA_HC_PERSIST=1 (HIP): the multi read as one persistent kernel (80 resident blocks, the down projection
 /// split by column slices, two grid barriers).  Another summation order (not bitwise).

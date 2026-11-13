@@ -21,6 +21,8 @@
 //      the end into the next expert's bytes without faulting.
 #pragma once
 
+#include <cstdlib>
+
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/exchange_storage.hpp"
@@ -50,6 +52,18 @@ struct ExpertLayout;
 }
 
 namespace strata::core {
+
+/// personal fork (2026-11-13, roofline): STRATA_PCIE_SHARE_NODES=0 (opt-in; unset or 1 = as upstream).  The host plan never
+/// assigns a PCIe share (every miss goes to the CPU pool, as with --pcie-frac 0, whatever the request, the auto share or
+/// STRATA_PCIE_BALANCE say), so the verify window can leave out the share's nodes: the flag-B spin, fetch_blobs, rebase_ptrs
+/// and the share's grouped gate/up + down, five empty launches a layer.  Read once.
+inline bool pcie_share_nodes_off() {
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_PCIE_SHARE_NODES");
+        return v != nullptr && v[0] == '0';
+    }();
+    return off;
+}
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;

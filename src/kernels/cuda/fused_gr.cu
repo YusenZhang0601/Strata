@@ -644,6 +644,7 @@ __global__ void __launch_bounds__(THREADS, 4) gr_up75_kernel(GrMulti m) {
 }
 
 
+
 // 143-amdk (STRATA_QFUSE_HC): gr_up_multi_kernel with 32 columns a block (512 threads, 80 blocks, the same 8 rows a warp), so a block owns a whole
 // q8_1 group of `mixed` and writes its image itself.  STRATA_QFUSE's version (16 columns a block) needs a counter, two fences and a last block
 // to finish the group; this one needs none.  Every row's math is gr_up_multi_kernel's.  Needs q8_mixed set for every token.
@@ -1154,6 +1155,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
+constexpr int kHcDeep = 4;   // personal fork: STRATA_HC_DEEP=1 (staged + deeper weight prefetch), opt-in
 constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
 constexpr int HQ = H_TILE / 8 / 32;
 constexpr int N_HTILES = D / H_TILE;                  // 8
@@ -1382,6 +1384,171 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
             m.a[k0 + k].lo[row] = x / (1.0f + __expf(-x));
         }
     }
+}
+
+// ---- personal fork (2026-11-13, roofline): STRATA_HC_DEEP=1 - the staged read with deeper weight prefetch (opt-in, default off).
+// gr_down_staged_kernel keeps one tile of weights in flight (5 uint4 a lane, ~20 KB an SM on its 41 blocks): every tile waits
+// on DRAM (A6000 T=3: 19.8 us for 6.6 MB, 335 GB/s; T=1 543 GB/s).  Here a lane holds PD tiles ahead in a register ring, and
+// WPB warps (rows) a block spread the 320 rows over 320 / WPB + 1 blocks.  Each row is still summed by one warp, its lane
+// accumulating chunks lane + 32 q of every tile in ascending order with the same dot8u and warp_sum, and lane k writes token
+// k: the same bits as gr_down_staged_kernel (fused_gr_selftest checks it against the plain read on the card).
+template <int NT>
+__device__ __forceinline__ void stage_htile_nt(const GrMulti& m, int T, int h, float4* buf, int t) {
+    for (int i = t; i < T * (H_TILE / 4); i += NT) {
+        const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);
+        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+        cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
+    }
+}
+template <int WPB, int RPW, int MAX_T, bool EXACT_T, int PD>
+__global__ void __launch_bounds__(WPB * 32) gr_down_deep_kernel(GrMulti m) {
+    // RPW rows a warp: the activation chunk a lane reads from shared memory serves RPW rows (shared-memory and L2 staging
+    // traffic per weight byte / RPW); each row keeps its own accumulators, chunk order, dot8u and warp_sum: the same bits.
+    constexpr int NT = WPB * 32;
+    constexpr int ROWS_PB = WPB * RPW;
+    constexpr int ROW_BLOCKS = LR / ROWS_PB;
+    static_assert(LR % ROWS_PB == 0 && WPB * RPW >= HC && PD >= 1 && PD < N_HTILES, "geometry");
+    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == ROW_BLOCKS;
+    int row[RPW];
+    bool active[RPW];
+    const uint4* w4[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        row[r] = inject_block ? warp * RPW + r : (blockIdx.x * WPB + warp) * RPW + r;
+        active[r] = !(inject_block && (m.a[0].w_inject == nullptr || row[r] >= HC));
+        w4[r] = reinterpret_cast<const uint4*>((inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active[r] ? row[r] : 0) * D);
+    }
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    float acc[RPW][MAX_T];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) acc[r][k] = 0.0f;
+    uint4 wv[PD + 1][RPW][HQ];                          // ring: tile h lives in slot h % (PD + 1)
+#pragma unroll
+    for (int p = 0; p < PD; ++p)
+#pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            if (active[r]) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) wv[p][r][q] = __ldg(w4[r] + p * (H_TILE / 8) + lane + 32 * q);
+            }
+    stage_htile_nt<NT>(m, T, 0, hbuf, t);
+    cp_async_commit();
+    stage_htile_nt<NT>(m, T, 1, hbuf + buf_f4, t);
+    cp_async_commit();
+#pragma unroll
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (h + PD < N_HTILES) {
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                if (active[r]) {
+#pragma unroll
+                    for (int q = 0; q < HQ; ++q) wv[(h + PD) % (PD + 1)][r][q] = __ldg(w4[r] + (h + PD) * (H_TILE / 8) + lane + 32 * q);
+                }
+        }
+        if (h + 1 < N_HTILES) cp_async_wait1();
+        else cp_async_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const int j = lane + 32 * q;
+            Bf16x8 wvq[RPW];
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) wvq[r] = unpack8(wv[h % (PD + 1)][r][q]);
+#pragma unroll
+            for (int k = 0; k < MAX_T; ++k) {
+                if (EXACT_T || k < T) {
+                    const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                    const float4 x0 = pk[j], x1 = pk[H_TILE / 8 + j];
+#pragma unroll
+                    for (int r = 0; r < RPW; ++r)
+                        if (active[r]) acc[r][k] += dot8u(wvq[r], x0, x1);
+                }
+            }
+        }
+        __syncthreads();
+        if (h + 2 < N_HTILES) stage_htile_nt<NT>(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        cp_async_commit();
+    }
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (!active[r]) continue;
+        float sm[MAX_T];
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) sm[k] = (EXACT_T || k < T) ? warp_sum(acc[r][k]) : 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            if ((!EXACT_T && k >= T) || lane != k) continue;
+            if (inject_block) {
+                m.a[k].inject_out[row[r]] = sm[k];
+            } else {
+                const float x = sm[k] / (float) HC;
+                m.a[k].lo[row[r]] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+}
+
+// personal fork: the deep read's shape - STRATA_HC_DEEP_WPB = 8 (default) or 4 warps (rows) a block, STRATA_HC_DEEP_PD = 2
+// (default) or 3 tiles of weights in flight ahead of the one being summed
+int g_deep_wpb = -1, g_deep_pd = -1, g_deep_rpw = -1;   // fused_gr_deep_shape (the bench); -1 = the environment
+int env_int(const char* name, int dflt) { const char* e = std::getenv(name); return e != nullptr && e[0] != '\0' ? std::atoi(e) : dflt; }
+int deep_wpb() { static const int v = env_int("STRATA_HC_DEEP_WPB", 8); const int x = g_deep_wpb > 0 ? g_deep_wpb : v; return x == 4 ? 4 : 8; }
+int deep_pd() { static const int v = env_int("STRATA_HC_DEEP_PD", 1); const int x = g_deep_pd > 0 ? g_deep_pd : v; return x >= 2 ? 2 : 1; }
+int deep_rpw() { static const int v = env_int("STRATA_HC_DEEP_RPW", 2); const int x = g_deep_rpw > 0 ? g_deep_rpw : v; return x >= 2 ? 2 : 1; }
+template <int WPB, int RPW, int PD>
+void deep_down_attrs(int optin) {
+    auto set = [&](auto kernel, int max_t) {
+        int ws = (int) (2 * max_t * H_TILE * sizeof(float));
+        if (optin > 0 && ws > optin) ws = optin;
+        if (ws > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ws);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    };
+    set(gr_down_deep_kernel<WPB, RPW, 1, true, PD>, 1);
+    set(gr_down_deep_kernel<WPB, RPW, 2, true, PD>, 2);
+    set(gr_down_deep_kernel<WPB, RPW, 3, true, PD>, 3);
+    set(gr_down_deep_kernel<WPB, RPW, 4, true, PD>, 4);
+    set(gr_down_deep_kernel<WPB, RPW, 5, true, PD>, 5);
+    set(gr_down_deep_kernel<WPB, RPW, 6, true, PD>, 6);
+    set(gr_down_deep_kernel<WPB, RPW, kFusedGrMaxT, false, PD>, kFusedGrMaxT);
+}
+template <int WPB, int RPW, int PD>
+void deep_down_launch(const GrMulti& c, int ct, size_t smem, cudaStream_t st) {
+    const unsigned grid = LR / (WPB * RPW) + 1;
+    switch (ct) {
+        case 1: gr_down_deep_kernel<WPB, RPW, 1, true, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+        case 2: gr_down_deep_kernel<WPB, RPW, 2, true, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+        case 3: gr_down_deep_kernel<WPB, RPW, 3, true, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+        case 4: gr_down_deep_kernel<WPB, RPW, 4, true, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+        case 5: gr_down_deep_kernel<WPB, RPW, 5, true, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+        case 6: gr_down_deep_kernel<WPB, RPW, 6, true, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+        default: gr_down_deep_kernel<WPB, RPW, kFusedGrMaxT, false, PD><<<grid, WPB * 32, smem, st>>>(c); break;
+    }
+}
+void deep_down(const GrMulti& c, int ct, size_t smem, cudaStream_t st) {
+    static bool attr[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 64 && !attr[dev]) {   // set before any capture: fused_gr_check's self-test launches it first
+        int optin = 0;
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        deep_down_attrs<8, 1, 2>(optin);
+        deep_down_attrs<8, 2, 1>(optin);
+        deep_down_attrs<8, 2, 2>(optin);
+        deep_down_attrs<4, 2, 1>(optin);
+        deep_down_attrs<4, 2, 2>(optin);
+        cudaGetLastError();
+        attr[dev] = true;
+    }
+    const int w = deep_wpb(), r = deep_rpw(), p = deep_pd();
+    if (r == 1) deep_down_launch<8, 1, 2>(c, ct, smem, st);
+    else if (w == 8) { if (p == 2) deep_down_launch<8, 2, 2>(c, ct, smem, st); else deep_down_launch<8, 2, 1>(c, ct, smem, st); }
+    else { if (p == 2) deep_down_launch<4, 2, 2>(c, ct, smem, st); else deep_down_launch<4, 2, 1>(c, ct, smem, st); }
 }
 
 // the current device is Volta (sm_70): the fast norm/up is its default
@@ -1642,7 +1809,9 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
         // (decided once per device: this runs per layer when decode is not captured)
         const bool max4 = ct <= 4 && gr_down_max4();
-        if (staged) {
+        if (staged && variant == kHcDeep) {
+            deep_down(c, ct, smem, st);   // personal fork: STRATA_HC_DEEP=1
+        } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             const int tg = down_tg(ct);
@@ -3231,6 +3400,130 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
 
 }  // namespace
 
+// personal fork: STRATA_HC_DEEP=1 (opt-in, default off) asks for the deep read; it runs only after it matched the plain read
+// bit for bit on this card for 1-8 tokens, with and without the pending write and the inject rows (random weights and inputs).
+static bool hc_deep_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_DEEP"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+static bool fused_gr_selftest_deep(std::string& why) {
+    constexpr int TM = kFusedGrMaxT;
+    std::mt19937 rng(20261113u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
+    std::vector<float> h_norm(D), h_R((size_t) TM * D), h_bo((size_t) TM * N), h_ip((size_t) TM * HC);
+    for (auto& w : h_down) w = bf16_from_f32(0.02f * nd(rng));
+    for (auto& w : h_up) w = bf16_from_f32(0.05f * nd(rng));
+    for (auto& w : h_inj) w = bf16_from_f32(0.02f * nd(rng));
+    for (auto& w : h_norm) w = 1.0f + 0.1f * nd(rng);
+    for (auto& x : h_R) x = nd(rng);
+    for (auto& x : h_bo) x = 0.5f * nd(rng);
+    for (auto& x : h_ip) x = 2.0f * nd(rng);
+    struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; };
+    const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);
+    const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
+                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + 2 * n_set) * 4 + 32 * 256;
+    uint8_t* base = nullptr;
+    if (cudaMalloc((void**) &base, bytes) != cudaSuccess) { cudaGetLastError(); why = "no room for the check"; return false; }
+    size_t off = 0;
+    auto take = [&](size_t b) { void* p = base + off; off += (b + 255) / 256 * 256; return p; };
+    uint16_t* d_down = (uint16_t*) take(h_down.size() * 2);
+    uint16_t* d_up = (uint16_t*) take(h_up.size() * 2);
+    uint16_t* d_inj = (uint16_t*) take(h_inj.size() * 2);
+    float* d_norm = (float*) take(h_norm.size() * 4);
+    float* d_R = (float*) take(h_R.size() * 4);
+    float* d_bo = (float*) take(h_bo.size() * 4);
+    float* d_ip = (float*) take(h_ip.size() * 4);
+    Set set[2];
+    for (Set& x : set) {
+        x.R_out = (float*) take((size_t) TM * D * 4); x.xn = (float*) take((size_t) TM * D * 4);
+        x.lo = (float*) take((size_t) TM * LR * 4); x.rs = (float*) take((size_t) TM * HC * 4);
+        x.inj = (float*) take((size_t) TM * HC * 4); x.mixed = (float*) take((size_t) TM * N * 4);
+    }
+    cudaStream_t st = nullptr;
+    bool ok = off <= bytes && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaMemcpy(d_down, h_down.data(), h_down.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemcpy(d_up, h_up.data(), h_up.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemcpy(d_inj, h_inj.data(), h_inj.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemcpy(d_norm, h_norm.data(), h_norm.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemcpy(d_R, h_R.data(), h_R.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemcpy(d_bo, h_bo.data(), h_bo.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemcpy(d_ip, h_ip.data(), h_ip.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) why = "setting up the check failed";
+    std::vector<uint32_t> h1, h2;
+    for (int inject = 0; inject < 2 && ok; ++inject)
+        for (int apply = 0; apply < 2 && ok; ++apply)
+            for (int T = 1; T <= TM && ok; ++T) {
+                FusedGrArgs a[2][TM];
+                for (int v = 0; v < 2; ++v) {
+                    const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
+                    ok = ok && cudaMemsetAsync(set[v].R_out, 0xFF, span, st) == cudaSuccess;
+                    for (int k = 0; k < T; ++k) {
+                        FusedGrArgs& x = a[v][k];
+                        x.R = d_R + (size_t) k * D; x.R_out = set[v].R_out + (size_t) k * D; x.apply = apply != 0;
+                        x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
+                        x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = inject ? d_inj : nullptr; x.eps = 1e-6f;
+                        x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
+                        x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
+                    }
+                    GrMulti m;
+                    for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
+                    m.xn = set[v].xn;
+                    m.T = T;
+                    launch_multi(m, v == 0 ? kHcPlain : kHcDeep, st, nullptr, 0);
+                }
+                if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
+                    why = "a kernel of the check failed";
+                    ok = false;
+                    break;
+                }
+                // lo, rs, inject (when given), mixed, R_out (when the pending write is applied): every bit
+                const struct { size_t o, n; const char* what; bool use; } parts[] = {
+                    {(size_t) ((uint8_t*) set[0].lo - (uint8_t*) set[0].R_out) / 4, (size_t) T * LR, "lo", true},
+                    {(size_t) ((uint8_t*) set[0].rs - (uint8_t*) set[0].R_out) / 4, (size_t) T * HC, "rs", true},
+                    {(size_t) ((uint8_t*) set[0].inj - (uint8_t*) set[0].R_out) / 4, (size_t) T * HC, "inject", inject != 0},
+                    {(size_t) ((uint8_t*) set[0].mixed - (uint8_t*) set[0].R_out) / 4, (size_t) T * N, "mixed", true},
+                    {0, (size_t) T * D, "R", apply != 0}};
+                for (const auto& p : parts) {
+                    if (!p.use) continue;
+                    h1.resize(p.n); h2.resize(p.n);
+                    const float* p1 = set[0].R_out + p.o;
+                    const float* p2 = set[1].R_out + p.o;
+                    if (cudaMemcpy(h1.data(), p1, p.n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                        cudaMemcpy(h2.data(), p2, p.n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        why = "reading back the check failed";
+                        ok = false;
+                        break;
+                    }
+                    for (size_t i = 0; i < p.n; ++i)
+                        if (h1[i] != h2[i]) {
+                            char buf[200];
+                            std::snprintf(buf, sizeof buf, "%s differs for %d token(s)%s%s at %zu (%08x, not %08x)", p.what, T,
+                                          apply ? " with the pending write" : "", inject ? " with inject" : "", i, h2[i], h1[i]);
+                            why = buf;
+                            ok = false;
+                            break;
+                        }
+                    if (!ok) break;
+                }
+            }
+    if (st) cudaStreamDestroy(st);
+    cudaFree(base);
+    cudaGetLastError();
+    return ok;
+}
+
+// personal fork, the bench only: the multi read as a given variant (1 plain, 2 split, 3 staged, 4 deep), bf16 weights, no q8_1 image
+void fused_gr_read_multi_variant(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, int variant,
+                                 unsigned long long* stamp_buf, int stamp_i0) {
+    GrMulti m;
+    for (int t = 0; t < n_tok; ++t) { m.a[t] = a[t]; m.a[t].q8_mixed = nullptr; }
+    m.xn = xn_scratch;
+    m.T = n_tok;
+    launch_multi(m, variant, (cudaStream_t) stream, stamp_buf, stamp_i0);
+}
+void fused_gr_deep_shape(int wpb, int pd, int rpw) { g_deep_wpb = wpb; g_deep_pd = pd; g_deep_rpw = rpw; }
+
 int fused_gr_variant() {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -3259,6 +3552,16 @@ void fused_gr_check() {
     int use = kHcPlain;
     if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
     else if (okv[kHcSplit]) use = kHcSplit;
+    if (hc_deep_env() && use == kHcStaged) {   // personal fork: STRATA_HC_DEEP=1
+        std::string wd;
+        if (fused_gr_selftest_deep(wd)) {
+            use = kHcDeep;
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_DEEP=1: the staged read with %d down rows a warp, %d warps a block, %d weight tiles ahead "
+                                 "(checked bit for bit against the plain read on this card, 1-8 tokens)\n", dev, deep_rpw(), deep_wpb(), deep_pd());
+        } else {
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_DEEP=1 is off here: %s\n", dev, wd.c_str());
+        }
+    }
     g_variant[dev].store(use);
     if (!ran)
         std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
@@ -3267,10 +3570,11 @@ void fused_gr_check() {
         if (v <= want && !okv[v] && ran)
             std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
                                  "%s\n", dev, name[v], why[v].c_str());
-    static const char* const what[4] = {
+    static const char* const what[5] = {
         "", "the plain read (the norm per token, the down projection on 41 blocks)",
         "split (the norm per token and stream, then the plain read's down projection)",
-        "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
+        "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)",
+        "deep (staged, several down rows a warp; personal fork, STRATA_HC_DEEP=1)"};
     std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
