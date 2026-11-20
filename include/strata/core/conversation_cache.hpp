@@ -257,6 +257,7 @@ public:
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
+    size_t expired() const { return expired_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
@@ -424,9 +425,52 @@ public:
         const size_t n = entries_.size();
         entries_.clear();
         serials_.clear();
+        parked_at_ms_.clear();
         bytes_ = 0;
         reuse_ = {};
         return n;
+    }
+
+    // Opt-in TTL expiry (STRATA_CONV_CACHE_TTL_S): drop unpinned, unguarded parked entries whose age reaches ttl_ms.
+    // Returns how many entries were dropped.  ttl_ms <= 0 is a no-op (upstream behavior).
+    size_t expire(int64_t now_ms, int64_t ttl_ms) {
+        if (ttl_ms <= 0) return 0;
+        size_t dropped = 0;
+        for (size_t i = 0; i < entries_.size();) {
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) {
+                ++i;
+                continue;
+            }
+            if (now_ms - parked_at_ms_[i] >= ttl_ms) {
+                bytes_ -= entries_[i].bytes();
+                erase(i);
+                ++expired_;
+                ++dropped;
+                continue;
+            }
+            ++i;
+        }
+        return dropped;
+    }
+
+    // Earliest steady-clock deadline (in ms) when a non-pinned, non-guarded entry expires, or -1 if none / disabled.
+    int64_t next_expiry_ms(int64_t ttl_ms) const {
+        if (ttl_ms <= 0) return -1;
+        int64_t earliest = -1;
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            const int64_t due = parked_at_ms_[i] + ttl_ms;
+            if (earliest < 0 || due < earliest) earliest = due;
+        }
+        return earliest;
+    }
+
+    // Refresh a parked entry's timestamp (e.g., when a sibling borrows its prefix).
+    bool touch(uint64_t serial, int64_t now_ms) {
+        const size_t i = index_of(serial);
+        if (i == SIZE_MAX) return false;
+        parked_at_ms_[i] = now_ms;
+        return true;
     }
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
@@ -514,13 +558,14 @@ public:
         return longest;
     }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    bool put(SavedConversation&& image, size_t held = 0, int64_t now_ms = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);
+        parked_at_ms_.push_back(now_ms);
         bytes_ += n;
         return true;
     }
@@ -529,11 +574,13 @@ private:
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
+        parked_at_ms_.erase(parked_at_ms_.begin() + (std::ptrdiff_t) index);
     }
-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
+    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, expired_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
+    std::deque<int64_t> parked_at_ms_;      // steady-clock ms when each entry was parked or last touched
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;

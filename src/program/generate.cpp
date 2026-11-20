@@ -11440,6 +11440,33 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // Personal opt-in (STRATA_CONV_CACHE_TTL_S): expire idle parked conversations after N seconds (0/unset = off).
+        const int64_t conv_ttl_s = [&]() -> int64_t {
+            const char* v = std::getenv("STRATA_CONV_CACHE_TTL_S");
+            if (!v || !*v) return 0;
+            char* end = nullptr;
+            const long long s = std::strtoll(v, &end, 10);
+            constexpr long long kMaxTtlS = 365LL * 86400LL;
+            return (end != v && *end == '\0' && s > 0) ? (int64_t) std::min(s, kMaxTtlS) : 0;
+        }();
+        const int64_t conv_ttl_ms = conv_ttl_s > 0 ? conv_ttl_s * 1000 : 0;
+        if (conv_ttl_s > 0 && conversations.enabled())
+            std::fprintf(stderr, "strata serve: conversation cache TTL enabled: %lld s (STRATA_CONV_CACHE_TTL_S)\n",
+                         (long long) conv_ttl_s);
+        auto now_steady_ms = []() -> int64_t {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+        };
+        auto expire_parked = [&](const char* when) {
+            if (conv_ttl_ms <= 0 || !conversations.enabled() || conversations.size() == 0) return;
+            const size_t dropped = conversations.expire(now_steady_ms(), conv_ttl_ms);
+            if (dropped > 0) {
+                std::fprintf(stderr, "strata serve: conversation cache: expired %zu parked conversation%s (%s, ttl=%llds); "
+                             "parked=%zu bytes=%zu expired=%zu\n",
+                             dropped, dropped == 1 ? "" : "s", when, (long long) conv_ttl_s,
+                             conversations.size(), conversations.bytes(), conversations.expired());
+                std::fflush(stderr);
+            }
+        };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -11744,7 +11771,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = conversations.put(std::move(image), held, now_steady_ms());
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -13166,12 +13193,23 @@ int main(int argc, char** argv) {
             st->cv.notify_one();
         }).detach();
         auto next_line = [&](std::string& out) -> bool {
-            std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-            if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
-            in_lines.pop_front();
-            return true;
+            for (;;) {
+                expire_parked("idle");
+                std::unique_lock<std::mutex> lk(in_mu);
+                const int64_t wake_ms = conv_ttl_ms > 0 ? conversations.next_expiry_ms(conv_ttl_ms) : -1;
+                if (wake_ms < 0) {
+                    in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+                } else {
+                    const int64_t rem = std::max<int64_t>(1, wake_ms - now_steady_ms());
+                    in_cv.wait_for(lk, std::chrono::milliseconds(rem), [&] { return !in_lines.empty() || in_eof; });
+                }
+                if (!in_lines.empty()) {
+                    out = std::move(in_lines.front());
+                    in_lines.pop_front();
+                    return true;
+                }
+                if (in_eof) return false;
+            }
         };
         sp.should_stop = [&] { return stop_req.load(); };
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
@@ -15636,6 +15674,7 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            expire_parked("request");
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
@@ -15707,7 +15746,7 @@ int main(int argc, char** argv) {
                                  (long long) strata::program::conv_cache::kRestoreFirstUseMib);
                     auto retry = std::move(*incoming);
                     incoming.reset();
-                    if (!conversations.put(std::move(retry)))
+                    if (!conversations.put(std::move(retry), 0, now_steady_ms()))
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
                     err.clear();
                 }
@@ -15903,6 +15942,7 @@ int main(int argc, char** argv) {
                 resume = parked.tokens;
                 from_live = false;
                 conversations.count_borrow();
+                conversations.touch(parked.serial, now_steady_ms());
                 std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
                              "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
                              (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),

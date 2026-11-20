@@ -745,5 +745,45 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {   // STRATA_CONV_CACHE_TTL_S: opt-in TTL expiry respects pinned/guarded entries and borrow touch()
+        ConversationCache cache(1 << 20, 4);
+        auto pinned = image({1, 2, 3});
+        pinned.checkpoints.push_back(ConversationCheckpoint{});
+        pinned.checkpoints.back().ids = {1, 2};
+        pinned.checkpoints.back().pinned = true;
+        pinned.checkpoints.back().gdn.resize(64, 1);
+        const size_t pinned_bytes = pinned.bytes();
+        check(cache.put(std::move(pinned), 0, 1000), "park pinned entry at t=1000");
+        check(cache.put(image({10, 20, 30}), 0, 1000), "park old entry A at t=1000");
+        check(cache.put(image({40, 50, 60}), 0, 2000), "park newer entry B at t=2000");
+        const auto m_b = cache.best(std::vector<int32_t>{40, 50, 60, 70}, {}, true);
+        check(m_b.tokens == 3, "entry B matched");
+
+        check(cache.expire(999999, 0) == 0 && cache.size() == 3, "ttl<=0 is a no-op");
+        check(cache.next_expiry_ms(0) == -1, "ttl<=0 has no wakeup deadline");
+        check(cache.next_expiry_ms(1500) == 2500, "earliest non-pinned expiry is A at 1000+1500");
+
+        // Before A expires: nothing dropped
+        check(cache.expire(2499, 1500) == 0 && cache.size() == 3, "nothing expires before ttl");
+
+        // Guard A and verify guarded entry is spared
+        const auto m_a = cache.best(std::vector<int32_t>{10, 20, 30, 31}, {}, true);
+        cache.guard(m_a.serial);
+        check(cache.next_expiry_ms(1500) == 3500, "guarded A is skipped for next_expiry_ms, B is next");
+        check(cache.expire(2600, 1500) == 0 && cache.size() == 3, "guarded A is not expired");
+        cache.unguard();
+
+        // Touch B at t=2600 so B survives t=3600, while A expires at t=2600
+        check(cache.touch(m_b.serial, 2600), "touch refreshes B timestamp");
+        check(cache.expire(2600, 1500) == 1 && cache.size() == 2 && cache.expired() == 1 && cache.evictions() == 0,
+              "A expires at t=2600 while pinned and touched B survive");
+        check(cache.next_expiry_ms(1500) == 4100, "next deadline reflects touched B (2600+1500)");
+
+        // Expire B at t=4100; pinned entry still stays and next_expiry_ms becomes -1
+        check(cache.expire(4100, 1500) == 1 && cache.size() == 1 && cache.expired() == 2 && cache.bytes() == pinned_bytes,
+              "B expires at t=4100, bytes drop to pinned only");
+        check(cache.next_expiry_ms(1500) == -1, "only pinned entry remains -> no wakeup deadline");
+        check(cache.clear() == 1 && cache.size() == 0 && cache.bytes() == 0, "clear drops pinned entry and resets state");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
