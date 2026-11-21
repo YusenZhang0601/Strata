@@ -83,8 +83,17 @@ public:
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
-    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// `skip_kv_stage`: omit the full-context KV staging pool (only legal when RFC-K3-A sparse KV handles every chunk
+    /// <= `chunk` without staging into `m.stage`).
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, bool skip_kv_stage = false);
     int64_t chunk() const;
+
+    /// RFC-K3-A (opt-in, default OFF): STRATA_PREFILL_SPARSE_KV=1 skips full-prefix `kv_stage_from_host` for chunks up
+    /// to `sparse_kv_max_tokens()` (STRATA_PREFILL_SPARSE_MAX_T, default 768) and resolves only selected blocks in
+    /// pigeonhole zero-overflow sub-batches directly into the session's resident VRAM KV pool.
+    static bool sparse_kv_enabled();
+    static int64_t sparse_kv_max_tokens();
+    static bool sparse_kv_supported(const core::ModelGeometry& g, const core::SessionState& ss);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
@@ -172,6 +181,10 @@ public:
                                        bool src = true);
     static uint64_t bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                          bool src = true);
+    /// Same as `bytes_needed` without the full-context KV staging pool `m.stage` (for RFC-K3-A + RFC-K3-B small-chunk
+    /// dedicated buffers where every chunk <= sparse_kv_max_tokens() resolves sparsely into the session's resident pool).
+    static uint64_t bytes_needed_no_kv_stage(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                             bool src = true);
 
     /// The streamed ring's byte budget as a slot count for this pack (the measured slot count x Q2_0's blob, over
     /// max_blob, never past ring_cap()):
@@ -320,7 +333,7 @@ public:
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                      bool owned_pages, bool src);
+                                      bool owned_pages, bool src, bool skip_kv_stage = false);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
     // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages

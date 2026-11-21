@@ -1191,6 +1191,7 @@ struct Prefill::Impl {
     PrefillStats* stats = nullptr;
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
+    bool no_kv_stage = false;                // RFC-K3-A/B: current layout omitted m.stage (sparse KV only)
     int32_t* ident_table = nullptr;
     cudaStream_t kv_copy = nullptr;
     cudaEvent_t kv_released = nullptr, kv_ready = nullptr;
@@ -1243,6 +1244,31 @@ namespace {
 // STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
+// RFC-K3-A (opt-in, default OFF): STRATA_PREFILL_SPARSE_KV=1 skips the full-prefix kv_stage_from_host copy for chunks
+// up to STRATA_PREFILL_SPARSE_MAX_T (default 768, strictly < stream_all_min()=1024) and runs selection-first sparse
+// kv_stream_resolve in pigeonhole zero-overflow sub-batches directly into the session's resident VRAM KV pool.
+bool sparse_kv_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_SPARSE_KV");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+int64_t sparse_kv_max_t() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_SPARSE_MAX_T");
+        const long long n = e != nullptr ? std::atoll(e) : 768;
+        return n >= 1 ? (int64_t) n : (int64_t) 768;
+    }();
+    return v;
+}
+bool sparse_kv_check_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_SPARSE_CHECK");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
@@ -1700,7 +1726,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     return strata::metal_engine::window_ensure(g, ss, ss.qsa_states[ss.qsa_primary()].max_cells, err);
 #endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
-    m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_; m.no_kv_stage = false;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -2060,7 +2086,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    if (m.no_kv_stage) m.stage = strata::kernels::KvHostPools{};
+    else take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     m.group_cap = pf_group_scratch() && !m.fused_bufs ? group_cap_rows(T, m.g->n_expert) : 0;
     if (m.group_cap > 0 || hcr) {   // activation evidence: once per layout (a chunk size), what the switches took
@@ -2072,7 +2099,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     return ok;
 }
 
-bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, bool skip_kv_stage) {
     Impl& m = *impl_;
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
@@ -2087,6 +2114,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         err = "prefill: relayout: the stream failed";
         return false;
     }
+    const bool prev_no_kv_stage = m.no_kv_stage;
+    m.no_kv_stage = skip_kv_stage;
     bool ok = true;
     Alloc o;
     o.base = (uint8_t*) borrow;
@@ -2098,6 +2127,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
     if (ok) { std::string side_err; if (!m.gemm.set_dequant_side(gs2, side_err)) std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in front of their GEMMs\n", side_err.c_str()); }
     if (!ok || !carve((size_t) chunk, &o)) {
+        m.no_kv_stage = prev_no_kv_stage;
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
         (void) cudaGetLastError();
@@ -2111,6 +2141,23 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+bool Prefill::sparse_kv_enabled() { return sparse_kv_on(); }
+int64_t Prefill::sparse_kv_max_tokens() { return sparse_kv_max_t(); }
+bool Prefill::sparse_kv_supported(const core::ModelGeometry& g, const core::SessionState& ss) {
+    if (!sparse_kv_on()) return false;
+    const strata::kernels::QsaShapes s = core::qsa_shapes(g);
+    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const int64_t max_pages_per_q = (cap + s.page_size - 1) / s.page_size + 1;
+    bool any_streamed = false;
+    for (const core::QsaState& st : ss.qsa_states) {
+        if (st.kv_mode != 1) continue;
+        any_streamed = true;
+        if (st.n_slots < max_pages_per_q || st.map.page_table == nullptr || st.map.ctl == nullptr ||
+            !st.host.present())
+            return false;
+    }
+    return any_streamed;
+}
 
 void Prefill::set_ring_room_active(bool on) {
     ring_room_active_ = on;
@@ -2744,18 +2791,23 @@ int64_t Prefill::chain_experts_streamed() const {
 }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
-    return bytes_needed_impl(g, ss, chunk, false, src);
+    return bytes_needed_impl(g, ss, chunk, false, src, false);
+}
+
+uint64_t Prefill::bytes_needed_no_kv_stage(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                           bool src) {
+    return bytes_needed_impl(g, ss, chunk, false, src, true);
 }
 
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
 // page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.
 uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool src) {
-    return bytes_needed_impl(g, ss, chunk, true, src);
+    return bytes_needed_impl(g, ss, chunk, true, src, false);
 }
 
 uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                    bool owned_pages, bool src) {
+                                    bool owned_pages, bool src, bool skip_kv_stage) {
     // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -2812,7 +2864,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok);
+    if (!skip_kv_stage) take_stage(o, ss, s, stage, ok);
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -3535,8 +3587,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         int64_t kv_pending = -1;
+        // RFC-K3-A (STRATA_PREFILL_SPARSE_KV=1): small chunks resolve selected KV blocks on demand directly into each
+        // QSA layer's resident VRAM pool after top-k selection, skipping full-prefix kv_stage_from_host & kv_prefetch.
+        const bool chunk_sparse_kv = sparse_kv_on() && T <= sparse_kv_max_t();
         auto kv_prefetch_after = [&](int64_t layer, int64_t ordinal) -> bool {
-            if (!kv_prefetch || p0 <= 0) return true;
+            if (!kv_prefetch || p0 <= 0 || chunk_sparse_kv || m.no_kv_stage) return true;
             if (kv_pending >= 0) return true;   // one staging pool: the pending prefetch has not been consumed yet
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
@@ -4162,8 +4217,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     }
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
-                    // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
-                    const bool staged = st.kv_mode == 1;
+                    // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks.
+                    // RFC-K3-A (sparse_kv): skip full-prefix staging here; kv_append writes st.host (and resident VRAM
+                    // slots), and after top-k selection qsa_kv_resolve brings only the selected pages into VRAM.
+                    const int64_t max_pages_per_q = (m.cap + s.page_size - 1) / s.page_size + 1;
+                    const bool sparse_kv = chunk_sparse_kv && !kva_state_only && st.kv_mode == 1 &&
+                                           st.n_slots >= max_pages_per_q && st.map.page_table != nullptr &&
+                                           st.map.ctl != nullptr && st.host.present();
+                    const bool staged = st.kv_mode == 1 && !sparse_kv && !(kva_state_only && m.no_kv_stage);
+                    if (staged && !m.stage.present()) {
+                        err = "prefill: KV staging pool missing for staged QSA layer " + std::to_string(l);
+                        return false;
+                    }
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
@@ -4379,42 +4444,120 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
-                    pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
                     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    const bool gated = !old_attn && !st.kv_rot && !st.kv_hybrid && qsa_fuse_gate() &&
-                                       strata::kernels::qsa_prompt_attn_batch_gated(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.Qf,
-                                                                                    m.attn_h, ld_a > 0 ? ld_a : ZV, T, m.cs);
-                    {
-                        static bool told = false;   // once: which of the two fusions this run took
-                        if (!told) {
-                            told = true;
-                            std::fprintf(stderr, "strata prefill: QSA layers: norm + rope in one pass %s, attention gate in the attention epilogue %s\n",
-                                         qsa_fuse_nr() ? "on" : "off", gated ? "on" : "off");
-                        }
-                    }
-                    // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
-                    // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
-                    // queries a batch in the same scratch; any refusal or launch failure runs the loop below
-                    if (!gated && (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                                        m.attn, T, m.cs)))
-#if !defined(STRATA_GPU_METAL)   // qsa_pattn.cu is in the CUDA / HIP kernel library only
-                        if (!(strata::kernels::pattn_mode() != 0 &&
-                              strata::kernels::qsa_pattn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch,
-                                                               (uint64_t) m.attn_batch *
-                                                                   strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s),
-                                                               m.attn, T, m.cs)))
+                    bool gated = false;
+                    if (sparse_kv) {
+                        // RFC-K3-A: pigeonhole zero-overflow sub-batching into st's resident VRAM pool.
+                        // Every top-k kernel in qsa_select.cu emits strictly ascending unique cell IDs in [0, n_kv),
+                        // so each query spans at most max_pages_per_q = ceil(cap / page_size) + 1 pages and
+                        // sub_b = floor(st.n_slots / max_pages_per_q) >= 1 queries fit without evicting each other.
+                        const int64_t sub_b = std::max<int64_t>(1, st.n_slots / max_pages_per_q);
+                        bool try_gated = !old_attn && !st.kv_rot && !st.kv_hybrid && qsa_fuse_gate();
+                        const int64_t attn_h_stride = ld_a > 0 ? ld_a : ZV;
+                        bool used_gated = false;
+                        bool logged_sub = false;
+                        for (int64_t t0 = 0; t0 < T; t0 += sub_b) {
+                            const int64_t nb = std::min(sub_b, T - t0);
+                            pt.mark(kPfKvStage, cs);
+                            core::qsa_kv_resolve(st, g, m.sel_ids + t0 * m.cap,
+                                                 m.steps_dev + t0 * strata::kernels::kStepCount, nb, m.cap, m.cs);
+                            if (sparse_kv_check_on()) {
+                                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                                    err = "prefill: sparse KV resolve stream sync failed at layer " + std::to_string(l);
+                                    return false;
+                                }
+                                const strata::kernels::KvStreamCounters kc = strata::kernels::kv_stream_counters(st.map);
+                                if (kc.overflow) {
+                                    err = "prefill: sparse KV resolve overflowed resident slots at layer " +
+                                          std::to_string(l) + " (sub_b=" + std::to_string(sub_b) +
+                                          ", n_slots=" + std::to_string(st.n_slots) + ")";
+                                    return false;
+                                }
+                            }
+                            pt.mark(kPfQsaAttn, cs);
+                            const bool sub_gated = try_gated &&
+                                                   strata::kernels::qsa_prompt_attn_batch_gated(
+                                                       m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                       m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s,
+                                                       m.Qf + t0 * (2 * ZV), m.attn_h + t0 * attn_h_stride,
+                                                       attn_h_stride, nb, m.cs);
+                            if (!logged_sub) {
+                                logged_sub = true;
+                                static bool told = false;
+                                if (!told) {
+                                    told = true;
+                                    std::fprintf(stderr, "strata prefill: QSA layers: norm + rope in one pass %s, attention gate in the attention epilogue %s, sparse KV on (sub_b=%lld, n_slots=%lld)\n",
+                                                 qsa_fuse_nr() ? "on" : "off", sub_gated ? "on" : "off",
+                                                 (long long) sub_b, (long long) st.n_slots);
+                                }
+                            }
+                            if (sub_gated) {
+                                used_gated = true;
+                            } else {
+                                if (!used_gated) try_gated = false;
+                                if (old_attn || !strata::kernels::qsa_prompt_attn_batch(
+                                                    m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s,
+                                                    m.attn + t0 * ZV, nb, m.cs))
+#if !defined(STRATA_GPU_METAL)
+                                    if (!(strata::kernels::pattn_mode() != 0 &&
+                                          strata::kernels::qsa_pattn_batch(
+                                              m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                              m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s, m.attn_scratch,
+                                              (uint64_t) m.attn_batch *
+                                                  strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s),
+                                              m.attn + t0 * ZV, nb, m.cs)))
 #endif
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                                    for (int64_t u0 = 0; u0 < nb; u0 += m.attn_batch) {
+                                        const int64_t nu = std::min(m.attn_batch, nb - u0);
+                                        strata::kernels::qsa_decode_attn_batch(
+                                            m.q + (t0 + u0) * ZV, pools, m.sel_ids + (t0 + u0) * m.cap,
+                                            m.steps_dev + (t0 + u0) * strata::kernels::kStepCount, m.cap, s,
+                                            m.attn_scratch, m.attn + (t0 + u0) * ZV, nu, m.cs);
+                                    }
+                                if (used_gated)
+                                    gate_attn(m.attn + t0 * ZV, m.Qf + t0 * (2 * ZV), m.attn_h + t0 * attn_h_stride,
+                                              nb, m.cs, ld_a);
+                            }
                         }
+                        gated = used_gated;
+                    } else {
+                        pt.mark(kPfQsaAttn, cs);
+                        gated = !old_attn && !st.kv_rot && !st.kv_hybrid && qsa_fuse_gate() &&
+                                strata::kernels::qsa_prompt_attn_batch_gated(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.Qf,
+                                                                             m.attn_h, ld_a > 0 ? ld_a : ZV, T, m.cs);
+                        {
+                            static bool told = false;   // once: which of the two fusions this run took
+                            if (!told) {
+                                told = true;
+                                std::fprintf(stderr, "strata prefill: QSA layers: norm + rope in one pass %s, attention gate in the attention epilogue %s\n",
+                                             qsa_fuse_nr() ? "on" : "off", gated ? "on" : "off");
+                            }
+                        }
+                        // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
+                        // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
+                        // queries a batch in the same scratch; any refusal or launch failure runs the loop below
+                        if (!gated && (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                                                                                            m.attn, T, m.cs)))
+#if !defined(STRATA_GPU_METAL)   // qsa_pattn.cu is in the CUDA / HIP kernel library only
+                            if (!(strata::kernels::pattn_mode() != 0 &&
+                                  strata::kernels::qsa_pattn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch,
+                                                                   (uint64_t) m.attn_batch *
+                                                                       strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s),
+                                                                   m.attn, T, m.cs)))
+#endif
+                            for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                                const int64_t nb = std::min(m.attn_batch, T - t0);
+                                strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                       m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                       s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                            }
+                    }
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
@@ -6386,6 +6529,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     // The DFlash2 drafter's prompt taps it carries for one stage and one prompt (DF-08: lm_run taps a layer's completed output when the next layer starts)
     if (!tap_layers_.empty() && (split || !on_taps || tap_cap_ <= 0)) { why = "the DFlash2 drafter's prompt taps on a layer split"; return 0; }
     if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
+    if (m.no_kv_stage) { why = "the KV staging pool was omitted (STRATA_PREFILL_SPARSE_KV)"; return 0; }
+    if (sparse_kv_on() && n <= sparse_kv_max_t()) { why = "STRATA_PREFILL_SPARSE_KV handles small chunks in run_impl"; return 0; }
     if (stop_at_chunk) { why = "a batch read that yields at chunk boundaries"; return 0; }
     if (force_chunk_ > 0) { why = "a --prefill-pipe plan sets the chunks of this read"; return 0; }   // (left set for run_impl)
 #if STRATA_EXPERT_NIBBLE_BUILT   // the 4-bit expert slots (STRATA_EXPERT_NIBBLE) are gathered for MMQ only by run_impl
@@ -7420,6 +7565,10 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         }
                         const bool staged = st.kv_mode == 1;
+                        if (staged && !m.stage.present()) {
+                            err = "prefill: KV staging pool missing for layer-major QSA layer " + std::to_string(l);
+                            return false;
+                        }
                         if (staged) {
                             pt.mark(kPfKvStage, cs);
                             strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
