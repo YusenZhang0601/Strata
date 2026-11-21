@@ -10200,6 +10200,10 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
+            void* small_own_dev = nullptr;      // RFC-K3-B: dedicated small-chunk buffer (STRATA_PREFILL_WIN_SMALL_OWN)
+            uint64_t small_own_bytes = 0;       // allocated size of small_own_dev
+            int64_t small_own_chunk = 0;        // max chunk tokens covered by small_own_dev
+            bool small_own_no_kv_stage = false; // true when RFC-K3-A sparse KV lets small_own_dev omit m.stage
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
@@ -10223,6 +10227,18 @@ int main(int argc, char** argv) {
         // (decided above, before the lend regions were sized: a no-op here unless the resident RAM mode skipped it)
         decide_split_ring();
         std::vector<PfPart> pf_parts;
+        struct PfSmallOwnGuard {
+            std::vector<PfPart>& parts;
+            ~PfSmallOwnGuard() {
+                for (PfPart& p : parts) {
+                    if (p.small_own_dev != nullptr) {
+                        const strata::core::OnDevice on(p.dev);
+                        (void) cudaFree(p.small_own_dev);
+                        p.small_own_dev = nullptr;
+                    }
+                }
+            }
+        } pf_small_own_guard{pf_parts};
         int64_t pf_plan_chunk = 0;   // #2824: the host-aware plan's chunk for prompts longer than o.prefill_chunk (0: none)
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
@@ -10813,6 +10829,58 @@ int main(int argc, char** argv) {
         };
         arm_prompt_helpers();
         mem_mark("the head and the prompt path");
+        // RFC-K3-B (opt-in, default OFF): STRATA_PREFILL_WIN_SMALL_OWN=1 allocates a dedicated small-chunk prefill
+        // scratch buffer per borrowing stage (default STRATA_PREFILL_WIN_SMALL_MAX_T=768, strictly < stream_all_min()=1024
+        // so the 384-slot expert ring is not included), guarded by a hard 2048 MiB free-VRAM floor. Incremental turns
+        // <= small_t relayout into small_own_dev with zero expert-cache lend/evict/refill; larger cold prompts still
+        // borrow expert slots at full o.prefill_chunk.
+        if (const char* v_own = std::getenv("STRATA_PREFILL_WIN_SMALL_OWN");
+            v_own != nullptr && std::atoi(v_own) != 0 && !pf_parts.empty() && !o.prefill_head_alias) {
+            const char* v_max = std::getenv("STRATA_PREFILL_WIN_SMALL_MAX_T");
+            const int64_t raw_t = v_max != nullptr ? std::atoll(v_max) : 768;
+            const int64_t cap_t = std::min<int64_t>(1024, o.prefill_chunk);
+            const int64_t small_t = request_chunk(raw_t > 0 ? raw_t : 768, cap_t);
+            constexpr uint64_t kVramFloorBytes = 2048ull << 20;   // Gate G6: keep >= 2048 MiB free VRAM
+            for (PfPart& p : pf_parts) {
+                if (p.first < 0 || small_t <= 0) continue;
+                const strata::core::OnDevice on(p.dev);
+                const bool has_src = (p.dev < 0 ? prefill_src : srcp) != nullptr;
+                const bool no_kv_stage =
+                    strata::prefill::Prefill::sparse_kv_supported(g, *p.ses) &&
+                    small_t <= strata::prefill::Prefill::sparse_kv_max_tokens();
+                auto bytes_for = [&](int64_t c) -> uint64_t {
+                    return no_kv_stage
+                        ? strata::prefill::Prefill::bytes_needed_no_kv_stage(g, *p.ses, c, has_src)
+                        : strata::prefill::Prefill::bytes_needed(g, *p.ses, c, has_src);
+                };
+                uint64_t need = bytes_for(small_t);
+                for (int64_t c = 256; c < small_t; c += 256) need = std::max(need, bytes_for(c));
+                const size_t free_now = strata::core::device_free_bytes();
+                if (need == 0 || (uint64_t) free_now < need + kVramFloorBytes) {
+                    std::fprintf(stderr, "strata serve: STRATA_PREFILL_WIN_SMALL_OWN skipped on CUDA%d: need %.1f MiB "
+                                 "+ 2048 MiB floor > %.1f MiB free (small_t=%lld, no_kv_stage=%d)\n",
+                                 p.dev < 0 ? 0 : p.dev, (double) need / 1048576.0, (double) free_now / 1048576.0,
+                                 (long long) small_t, no_kv_stage ? 1 : 0);
+                    continue;
+                }
+                void* dev_buf = nullptr;
+                if (cudaMalloc(&dev_buf, (size_t) need) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    std::fprintf(stderr, "strata serve: STRATA_PREFILL_WIN_SMALL_OWN cudaMalloc(%.1f MiB) failed on "
+                                 "CUDA%d, keeping borrow path\n", (double) need / 1048576.0, p.dev < 0 ? 0 : p.dev);
+                    continue;
+                }
+                p.small_own_dev = dev_buf;
+                p.small_own_bytes = need;
+                p.small_own_chunk = small_t;
+                p.small_own_no_kv_stage = no_kv_stage;
+                const size_t free_after = strata::core::device_free_bytes();
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_WIN_SMALL_OWN on CUDA%d: %.1f MiB for chunks <= %lld "
+                             "tokens (no_kv_stage=%d, %.1f MiB VRAM free after)\n",
+                             p.dev < 0 ? 0 : p.dev, (double) need / 1048576.0, (long long) small_t,
+                             no_kv_stage ? 1 : 0, (double) free_after / 1048576.0);
+            }
+        }
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
         // S-token chunk's buffers for the whole session (0.1.29's own buffers, carved from the tail of its cache):
         // a request of at most S prompt tokens then lends, streams and refills nothing, a longer one lends (and
@@ -16629,6 +16697,16 @@ int main(int argc, char** argv) {
                         if (!refill_one(p, e)) return false;
                     }
                     const strata::core::OnDevice on(p.dev);
+                    // RFC-K3-B: small-chunk dedicated workspace fast path - zero slots evicted, zero res_upload, zero refill.
+                    if (!o.prefill_head_alias && p.small_own_dev != nullptr && want <= p.small_own_chunk) {
+                        if (want != p.sp->chunk() || p.first_now != -2) {
+                            if (!p.sp->relayout(want, p.small_own_dev, p.small_own_bytes, e, p.small_own_no_kv_stage))
+                                return false;
+                            p.first_now = -2;
+                        }
+                        p.lent_chunk = want;
+                        continue;
+                    }
                     int64_t want_p = want;
                     int32_t first = p.first_now;
                     // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout.
@@ -16660,7 +16738,9 @@ int main(int argc, char** argv) {
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
                     if (want_p != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e,
+                                            /*skip_kv_stage=*/false))
+                            return false;
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
