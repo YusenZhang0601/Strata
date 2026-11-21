@@ -2080,6 +2080,7 @@ bool MtpDrafter::can_draft_slots(const BatchSlotDraft* items, int n_items) const
         if (sl->hnorm_stream_ != hnorm_stream_ || sl->q4_ != q4_ || sl->q4_head_ != q4_head_) return false;
         if (sl->head_ != head_ || sl->dhead_ != dhead_ || sl->dhead_type_ != dhead_type_ ||
             sl->dvocab_ != dvocab_ || sl->n_dvocab_ != n_dvocab_) return false;
+        if (sl->st_.kv_hybrid || st_.kv_hybrid) return false;
         if (sl->st_.kv_rot != st_.kv_rot || sl->st_.kv_q4 != st_.kv_q4 || sl->st_.kv_int8 != st_.kv_int8) return false;
         const int a = it.keep - 1;
         if (sl->st_.max_cells - (it.pos0 + a) < 1) return false;
@@ -2409,20 +2410,24 @@ bool MtpDrafter::record_rest_slots(int T, int32_t* step_d, const int32_t* pos_d,
             const char* v = std::getenv("STRATA_NO_MULTI_GR");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        for (int t = 0; t < T; ++t) {
-            if (!(T > 1 && native_moe_combine_enabled())) {
+        if (T > 1 && native_moe_combine_enabled()) {
+            native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
+        } else {
+            for (int t = 0; t < T; ++t) {
                 if (native_moe_combine_enabled())
                     native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
                 else
                     moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
             }
-            if (!fuse_head_gr && no_multi_gr)
-                gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
         }
-        if (T > 1 && native_moe_combine_enabled())
-            native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
-        if (!fuse_head_gr && !no_multi_gr)
-            gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
+        if (!fuse_head_gr) {
+            if (no_multi_gr) {
+                for (int t = 0; t < T; ++t)
+                    gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
+            } else {
+                gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
+            }
+        }
 
         // ---- final mixer + batched draft head (1x lm_head weight read for all T slots)
         bool q8_head = false;
