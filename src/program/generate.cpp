@@ -11457,12 +11457,15 @@ int main(int argc, char** argv) {
             return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
         };
         auto expire_parked = [&](const char* when) {
-            if (conv_ttl_ms <= 0 || !conversations.enabled() || conversations.size() == 0) return;
-            const size_t dropped = conversations.expire(now_steady_ms(), conv_ttl_ms);
-            if (dropped > 0) {
-                std::fprintf(stderr, "strata serve: conversation cache: expired %zu parked conversation%s (%s, ttl=%llds); "
+            if (conv_ttl_ms <= 0 || !conversations.enabled() ||
+                (conversations.size() == 0 && conversations.retained_bytes() == 0)) return;
+            bool cleared_reuse = false;
+            const size_t dropped = conversations.expire(now_steady_ms(), conv_ttl_ms, &cleared_reuse);
+            if (dropped > 0 || cleared_reuse) {
+                std::fprintf(stderr, "strata serve: conversation cache: expired %zu parked conversation%s%s (%s, ttl=%llds); "
                              "parked=%zu bytes=%zu expired=%zu\n",
-                             dropped, dropped == 1 ? "" : "s", when, (long long) conv_ttl_s,
+                             dropped, dropped == 1 ? "" : "s", cleared_reuse ? " + retained K/V" : "",
+                             when, (long long) conv_ttl_s,
                              conversations.size(), conversations.bytes(), conversations.expired());
                 std::fflush(stderr);
             }
@@ -15999,7 +16002,8 @@ int main(int argc, char** argv) {
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live,
+                                         now_steady_ms());
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 lent_slot = -1;   // (the main session holds the parked conversation now)

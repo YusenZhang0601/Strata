@@ -785,5 +785,44 @@ int main() {
         check(cache.next_expiry_ms(1500) == -1, "only pinned entry remains -> no wakeup deadline");
         check(cache.clear() == 1 && cache.size() == 0 && cache.bytes() == 0, "clear drops pinned entry and resets state");
     }
+    {   // RFC-S3A: retained reuse_ K/V also expires under STRATA_CONV_CACHE_TTL_S even when entries_ is empty
+        ConversationCache cache(1 << 20, 4);
+        ConversationKv kv;
+        kv.k.resize(1024, 3);
+        std::vector<ConversationKv> kvs;
+        kvs.push_back(std::move(kv));
+        cache.retain(std::move(kvs), 3, {}, {100, 101, 102}, 5000);
+        check(cache.size() == 0 && cache.retained_bytes() > 0 && cache.bytes() == cache.retained_bytes(),
+              "retained K/V accounts for cache bytes when no parked entries exist");
+        check(cache.next_expiry_ms(0) == -1, "ttl<=0 ignores retained K/V deadline");
+        check(cache.next_expiry_ms(1000) == 6000, "next_expiry_ms schedules retained K/V deadline (5000+1000)");
+        bool cleared_reuse = false;
+        check(cache.expire(5999, 1000, &cleared_reuse) == 0 && !cleared_reuse && cache.retained_bytes() > 0,
+              "retained K/V survives before ttl");
+        check(cache.expire(6000, 1000, &cleared_reuse) == 0 && cleared_reuse &&
+                  cache.retained_bytes() == 0 && cache.bytes() == 0 && cache.expired_reuse() == 1,
+              "retained K/V expires at ttl and drops total bytes to zero");
+        check(cache.next_expiry_ms(1000) == -1, "no wakeup deadline once retained K/V is cleared");
+    }
+    {   // RFC-S3A: next_expiry_ms picks the earlier of parked entries and retained reuse_ K/V, and touch() shifts deadline
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({200, 201, 202}), 0, 1000), "park entry C at t=1000");
+        const auto m_c = cache.best(std::vector<int32_t>{200, 201, 202, 203}, {}, true);
+        ConversationKv kv;
+        kv.k.resize(1024, 5);
+        std::vector<ConversationKv> kvs;
+        kvs.push_back(std::move(kv));
+        cache.retain(std::move(kvs), 3, {}, {300, 301, 302}, 1500);
+        check(cache.next_expiry_ms(1000) == 2000, "entry C expires before retained K/V");
+        check(cache.touch(m_c.serial, 1800), "touch C to t=1800");
+        check(cache.next_expiry_ms(1000) == 2500, "after touching C, retained K/V becomes earliest deadline (1500+1000)");
+        bool cleared_reuse = false;
+        check(cache.expire(2500, 1000, &cleared_reuse) == 0 && cleared_reuse && cache.size() == 1 &&
+                  cache.retained_bytes() == 0,
+              "at t=2500 retained K/V expires while touched C survives");
+        check(cache.next_expiry_ms(1000) == 2800, "remaining deadline is touched C (1800+1000)");
+        check(cache.expire(2800, 1000, &cleared_reuse) == 1 && !cleared_reuse && cache.size() == 0 && cache.bytes() == 0,
+              "at t=2800 C expires and total cache bytes reach zero");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

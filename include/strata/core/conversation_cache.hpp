@@ -258,6 +258,7 @@ public:
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
     size_t expired() const { return expired_; }
+    size_t expired_reuse() const { return expired_reuse_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
@@ -270,23 +271,35 @@ public:
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
     // `ids`: the conversation the K/V belongs to (take_reuse_for refuses it for any other; none: never reused).
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, std::vector<int32_t> ids = {}) {
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, std::vector<int32_t> ids = {},
+                int64_t now_ms = 0) {
         reuse_ = {};
+        reuse_at_ms_ = 0;
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}, std::move(ids)};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}, {}});
-        if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
+        if (enabled() && candidate.bytes() <= budget_ - bytes_) {
+            reuse_ = std::move(candidate);
+            reuse_at_ms_ = now_ms;
+        }
     }
     void limit_reuse(int64_t first_dirty) {
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
-        if (reuse_.unchanged_tokens <= 0) reuse_ = {};
+        if (reuse_.unchanged_tokens <= 0) {
+            reuse_ = {};
+            reuse_at_ms_ = 0;
+        }
     }
-    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    ConversationKvReuse take_reuse() {
+        reuse_at_ms_ = 0;
+        return std::exchange(reuse_, {});
+    }
     // The retained K/V for parking `live`: limited to the prefix `live` shares with the conversation it was captured
     // from, and nothing when they share none.  Without this a park after a batch slot gave its conversation back to the
     // main session wrote the RESTORED conversation's K/V into the new one's image (#1503, a cross-conversation leak).
     template<class Token>
     ConversationKvReuse take_reuse_for(const std::vector<Token>& live) {
+        reuse_at_ms_ = 0;
         ConversationKvReuse r = std::exchange(reuse_, {});
         const int64_t n = std::min<int64_t>((int64_t) r.ids.size(), (int64_t) live.size());
         int64_t same = 0;
@@ -392,7 +405,10 @@ public:
                 if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
+        if (bytes() > budget_ - held - incoming) {
+            reuse_ = {};
+            reuse_at_ms_ = 0;
+        }
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
@@ -428,12 +444,15 @@ public:
         parked_at_ms_.clear();
         bytes_ = 0;
         reuse_ = {};
+        reuse_at_ms_ = 0;
         return n;
     }
 
-    // Opt-in TTL expiry (STRATA_CONV_CACHE_TTL_S): drop unpinned, unguarded parked entries whose age reaches ttl_ms.
-    // Returns how many entries were dropped.  ttl_ms <= 0 is a no-op (upstream behavior).
-    size_t expire(int64_t now_ms, int64_t ttl_ms) {
+    // Opt-in TTL expiry (STRATA_CONV_CACHE_TTL_S): drop unpinned, unguarded parked entries and retained reuse K/V
+    // whose age reaches ttl_ms.  Returns how many parked entries were dropped; sets *cleared_reuse when retained
+    // reuse K/V was cleared.  ttl_ms <= 0 is a no-op (upstream behavior).
+    size_t expire(int64_t now_ms, int64_t ttl_ms, bool* cleared_reuse = nullptr) {
+        if (cleared_reuse) *cleared_reuse = false;
         if (ttl_ms <= 0) return 0;
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
@@ -450,16 +469,26 @@ public:
             }
             ++i;
         }
+        if (reuse_.bytes() > 0 && now_ms - reuse_at_ms_ >= ttl_ms) {
+            reuse_ = {};
+            reuse_at_ms_ = 0;
+            ++expired_reuse_;
+            if (cleared_reuse) *cleared_reuse = true;
+        }
         return dropped;
     }
 
-    // Earliest steady-clock deadline (in ms) when a non-pinned, non-guarded entry expires, or -1 if none / disabled.
+    // Earliest steady-clock deadline (in ms) when a non-pinned, non-guarded entry or retained K/V expires, or -1 if none / disabled.
     int64_t next_expiry_ms(int64_t ttl_ms) const {
         if (ttl_ms <= 0) return -1;
         int64_t earliest = -1;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
             const int64_t due = parked_at_ms_[i] + ttl_ms;
+            if (earliest < 0 || due < earliest) earliest = due;
+        }
+        if (reuse_.bytes() > 0) {
+            const int64_t due = reuse_at_ms_ + ttl_ms;
             if (earliest < 0 || due < earliest) earliest = due;
         }
         return earliest;
@@ -576,7 +605,7 @@ private:
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
         parked_at_ms_.erase(parked_at_ms_.begin() + (std::ptrdiff_t) index);
     }
-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, expired_ = 0, superseded_ = 0, borrowed_ = 0;
+    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, expired_ = 0, expired_reuse_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
@@ -584,6 +613,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    int64_t reuse_at_ms_ = 0;               // steady-clock ms when reuse_ was retained
 };
 
 } // namespace strata::core
