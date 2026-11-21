@@ -2151,8 +2151,10 @@ bool Prefill::sparse_kv_supported(const core::ModelGeometry& g, const core::Sess
     const int64_t max_pages_per_q = (cap + s.page_size - 1) / s.page_size + 1;
     // kv_stream.cu requires m.n_slots >= RT (1024) as well as >= max_pages_per_q for zero-overflow sub-batching.
     const int64_t min_slots = std::max<int64_t>(max_pages_per_q, 1024);
+    if (ss.qsa_states == nullptr || ss.qsa_alloc <= 0) return false;
     bool any_streamed = false;
-    for (const core::QsaState& st : ss.qsa_states) {
+    for (int64_t qi = ss.qsa_ord0; qi < ss.qsa_ord0 + ss.qsa_alloc; ++qi) {
+        const core::QsaState& st = ss.qsa_states[qi];
         if (st.kv_mode != 1) continue;
         any_streamed = true;
         if (st.n_slots < min_slots || st.map.page_table == nullptr || st.map.ctl == nullptr ||
