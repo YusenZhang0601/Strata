@@ -1121,11 +1121,11 @@ class IpcDeltaCodec:
                 hi = mid - 1
         return lo
 
-    def encode(self, prompt, allow_delta: bool = True) -> tuple[str, str, int | None]:
+    def encode(self, prompt, allow_delta: bool = True) -> tuple[str, str, int | None, int | None]:
         ids = prompt if isinstance(prompt, list) else list(prompt)
         n = len(ids)
         if n < self.MIN_TOKENS:
-            return "", ",".join(str(int(t)) for t in ids), None
+            return "", ",".join(str(int(t)) for t in ids), None, None
         first_tok = ids[0]
         # Snapshot entry list under lock, do heavy compare outside or briefly under lock (control path is serialized)
         best_id = None
@@ -1169,16 +1169,17 @@ class IpcDeltaCodec:
                 else:
                     pbuf = self._to_le32_bytes(ids[:best_lcp])
                     if pbuf is None:
-                        return "", ",".join(str(int(t)) for t in ids), None
+                        return "", ",".join(str(int(t)) for t in ids), None, None
                     pmv = memoryview(pbuf)
                     pref_crc = zlib.crc32(pmv) & 0xFFFFFFFF
                     pref_adl = zlib.adler32(pmv) & 0xFFFFFFFF
                 digest = (pref_crc << 32) | pref_adl
                 save_key = ""
+                save_id = None
                 if best_lcp != n or best_rn != n:
                     tbuf = self._to_le32_bytes(ids[best_lcp:])
                     if tbuf is None:
-                        return "", ",".join(str(int(t)) for t in ids), None
+                        return "", ",".join(str(int(t)) for t in ids), None, None
                     tmv = memoryview(tbuf)
                     full_crc = zlib.crc32(tmv, pref_crc) & 0xFFFFFFFF
                     full_adl = zlib.adler32(tmv, pref_adl) & 0xFFFFFFFF
@@ -1190,10 +1191,10 @@ class IpcDeltaCodec:
                     save_key = f" ref_save={save_id}"
                 dkeys = f" ref={best_id} keep={best_lcp} h={digest:016x}{save_key}"
                 payload = "-" if best_lcp == n else ",".join(map(str, ids[best_lcp:]))
-                return dkeys, payload, best_id
+                return dkeys, payload, best_id, save_id
             fbuf = self._to_le32_bytes(ids)
             if fbuf is None:
-                return "", ",".join(str(int(t)) for t in ids), None
+                return "", ",".join(str(int(t)) for t in ids), None, None
             fmv = memoryview(fbuf)
             full_crc = zlib.crc32(fmv) & 0xFFFFFFFF
             full_adl = zlib.adler32(fmv) & 0xFFFFFFFF
@@ -1202,7 +1203,7 @@ class IpcDeltaCodec:
             self._entries[save_id] = (list(ids), full_crc, full_adl)
             while len(self._entries) > self.MAX_SLOTS:
                 self._entries.popitem(last=False)
-        return f" ref_save={save_id}", ",".join(map(str, ids)), None
+        return f" ref_save={save_id}", ",".join(map(str, ids)), None, save_id
 
 
 class StrataEngine:
@@ -1798,17 +1799,17 @@ class StrataEngine:
     def _ipc_delta_on(self) -> bool:
         return _ipc_delta_env() and not getattr(self, "multi", 0) and (self.info or {}).get("ipc_delta") == 1
 
-    def _format_prompt_cmd(self, prefix: str, prompt, embeddings=None, allow_delta: bool = True) -> tuple[str, int | None]:
+    def _format_prompt_cmd(self, prefix: str, prompt, embeddings=None, allow_delta: bool = True) -> tuple[str, int | None, int | None]:
         if not self._ipc_delta_on():
             csv = ",".join(str(int(t)) for t in prompt)
-            return (f"{prefix} {embeddings} {csv}" if embeddings else f"{prefix} {csv}"), None
+            return (f"{prefix} {embeddings} {csv}" if embeddings else f"{prefix} {csv}"), None, None
         cur_gen = getattr(self, "gen", 0)
         if self._ipc_delta_gen != cur_gen:
             self._ipc_delta.clear()
             self._ipc_delta_gen = cur_gen
-        dkeys, payload, used_ref = self._ipc_delta.encode(prompt, allow_delta=allow_delta)
+        dkeys, payload, used_ref, save_id = self._ipc_delta.encode(prompt, allow_delta=allow_delta)
         cmd = f"{prefix}{dkeys} {embeddings} {payload}" if embeddings else f"{prefix}{dkeys} {payload}"
-        return cmd, used_ref
+        return cmd, used_ref, save_id
 
     def _send(self, text: str):
         btrace("send>", text[:60])
@@ -2262,13 +2263,13 @@ class StrataEngine:
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    started = getattr(cancel, "_strata_queue_started", None)
                     for allow_delta in (True, False):
-                        cmd, _used_ref = self._format_prompt_cmd(prefix, prompt, embeddings=embeddings,
-                                                                 allow_delta=allow_delta)
+                        cmd, _used_ref, _save_id = self._format_prompt_cmd(prefix, prompt, embeddings=embeddings,
+                                                                           allow_delta=allow_delta)
                         self._send(cmd)
                         if deadline is not None:
                             cancel._strata_queue_deadline = None
-                        started = getattr(cancel, "_strata_queue_started", None)
                         if started is not None:
                             started()
                             started = None
@@ -2302,6 +2303,8 @@ class StrataEngine:
                                     yield None
                         except _RefMiss as rm:
                             self._ipc_delta.drop(rm.ref_id)
+                            if _save_id is not None:
+                                self._ipc_delta.drop(_save_id)
                             phase = "none"
                             if not allow_delta:
                                 raise ValueError(f"engine rejected prompt ref {rm.ref_id}") from None
@@ -2409,14 +2412,14 @@ class StrataEngine:
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     if COALESCE_PREFILL > 1 and not embeddings:
                         self._coalesce(cancel, prompt)
+                    started = getattr(cancel, "_strata_queue_started", None)
                     try:
                         for allow_delta in (True, False):
-                            cmd, _used_ref = self._format_prompt_cmd(prefix, prompt, embeddings=embeddings,
-                                                                     allow_delta=allow_delta)
+                            cmd, _used_ref, _save_id = self._format_prompt_cmd(prefix, prompt, embeddings=embeddings,
+                                                                               allow_delta=allow_delta)
                             self._send(cmd)
                             if deadline is not None:
                                 cancel._strata_queue_deadline = None
-                            started = getattr(cancel, "_strata_queue_started", None)
                             if started is not None:
                                 started()
                                 started = None
@@ -2450,6 +2453,8 @@ class StrataEngine:
                                         yield None
                             except _RefMiss as rm:
                                 self._ipc_delta.drop(rm.ref_id)
+                                if _save_id is not None:
+                                    self._ipc_delta.drop(_save_id)
                                 phase = "none"
                                 if not allow_delta:
                                     raise ValueError(f"engine rejected prompt ref {rm.ref_id}") from None
@@ -2705,8 +2710,9 @@ class StrataEngine:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             prefix = f"GEN 0 prefill=1{rid_key}"
         used_ref = None
+        save_id = None
         try:
-            cmd, used_ref = self._format_prompt_cmd(prefix, ids, embeddings=embeddings, allow_delta=True)
+            cmd, used_ref, save_id = self._format_prompt_cmd(prefix, ids, embeddings=embeddings, allow_delta=True)
             if rid is not None:                          # several requests write to the engine at once
                 self._send(cmd)
             else:
@@ -2803,9 +2809,12 @@ class StrataEngine:
                     return
                 elif line.startswith("REF_MISS ") and used_ref is not None:
                     self._ipc_delta.drop(used_ref)
+                    if save_id is not None:
+                        self._ipc_delta.drop(save_id)
                     used_ref = None
+                    save_id = None
                     try:
-                        cmd, _ = self._format_prompt_cmd(prefix, ids, embeddings=embeddings, allow_delta=False)
+                        cmd, _, save_id = self._format_prompt_cmd(prefix, ids, embeddings=embeddings, allow_delta=False)
                         if rid is not None:
                             self._send(cmd)
                         else:

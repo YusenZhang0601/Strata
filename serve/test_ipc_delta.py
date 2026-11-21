@@ -136,18 +136,20 @@ class IpcDeltaCodecTest(unittest.TestCase):
             return "OK", ids, emb
 
         # Short prompt (<256): plain CSV
-        dk, pl, used = codec.encode([10, 20, 30])
-        self.assertEqual((dk, pl, used), ("", "10,20,30", None))
+        dk, pl, used, sid = codec.encode([10, 20, 30])
+        self.assertEqual((dk, pl, used, sid), ("", "10,20,30", None, None))
 
         # 6 incremental turns
         cur = list(range(100, 1100))
         for turn in range(6):
-            dk, pl, used = codec.encode(cur)
+            dk, pl, used, sid = codec.encode(cur)
             if turn == 0:
                 self.assertIsNone(used)
+                self.assertEqual(sid, 1)
                 self.assertIn("ref_save=1", dk)
             else:
                 self.assertIsNotNone(used)
+                self.assertIsNotNone(sid)
                 self.assertIn(f"keep={len(cur) - 47} ", dk)
             st, got, _ = decode_cmd(f"BGEN 0 32{dk} {pl}")
             self.assertEqual((st, got), ("OK", cur))
@@ -155,23 +157,28 @@ class IpcDeltaCodecTest(unittest.TestCase):
 
         # Mid-prompt divergence
         div = cur[:600] + [99999] * 25
-        dk, pl, _ = codec.encode(div)
+        dk, pl, _, _ = codec.encode(div)
         self.assertIn("keep=600 ", dk)
         self.assertEqual(decode_cmd(f"GEN 10{dk} {pl}"), ("OK", div, None))
 
         # Exact repeat with vision embedding path (empty delta sentinel '-')
-        dk_rep, pl_rep, _ = codec.encode(div)
+        dk_rep, pl_rep, _, sid_rep = codec.encode(div)
         self.assertEqual(pl_rep, "-")
+        self.assertIsNone(sid_rep)
         self.assertNotIn("ref_save=", dk_rep)
         self.assertEqual(decode_cmd(f"GENI 1{dk_rep} /tmp/emb.bin {pl_rep}"), ("OK", div, "/tmp/emb.bin"))
 
-        # Engine restart / eviction -> REF_MISS -> transparent resend full
+        # Engine restart / eviction -> REF_MISS -> drop BOTH used_ref and phantom save_id -> resend full
         refs.clear()
-        dk_m, pl_m, used_m = codec.encode(div + [42])
+        dk_m, pl_m, used_m, sid_m = codec.encode(div + [42])
         self.assertEqual(decode_cmd(f"GEN 10{dk_m} {pl_m}"), ("REF_MISS", used_m, None))
         codec.drop(used_m)
-        dk_f, pl_f, used_f = codec.encode(div + [42], allow_delta=False)
+        if sid_m is not None:
+            codec.drop(sid_m)
+        self.assertNotIn(sid_m, codec._entries)
+        dk_f, pl_f, used_f, sid_f = codec.encode(div + [42], allow_delta=False)
         self.assertIsNone(used_f)
+        self.assertIn(sid_f, codec._entries)
         self.assertEqual(decode_cmd(f"GEN 10{dk_f} {pl_f}"), ("OK", div + [42], None))
 
     def test_engine_default_off_and_ref_miss_recovery(self):
@@ -225,13 +232,103 @@ class IpcDeltaCodecTest(unittest.TestCase):
             self.assertEqual(list(eng.generate(prompt2, 4, {}, threading.Event())), [777])
             self.assertEqual(len(sent), 2)
             self.assertIn("ref=1 keep=400 ", sent[0])
+            failed_save_id = int(next(tok.split("=")[1] for tok in sent[0].split() if tok.startswith("ref_save=")))
+            retry_save_id = int(next(tok.split("=")[1] for tok in sent[1].split() if tok.startswith("ref_save=")))
             self.assertNotIn("ref=", sent[1])
-            self.assertIn("ref_save=", sent[1])
+            # Red-team #69 defect A: failed delta's phantom save_id must be evicted from _entries
+            self.assertNotIn(1, eng._ipc_delta._entries)
+            self.assertNotIn(failed_save_id, eng._ipc_delta._entries)
+            self.assertIn(retry_save_id, eng._ipc_delta._entries)
         finally:
             if old_env is None:
                 os.environ.pop("STRATA_IPC_DELTA", None)
             else:
                 os.environ["STRATA_IPC_DELTA"] = old_env
+
+    def test_batched_ref_miss_drops_phantom_save_and_calls_started_once(self):
+        """Red-team #69 defects A & B on BOTH solo and batch-admit paths of generate_batched()."""
+        for mode in ("solo", "admit"):
+            sent: list[str] = []
+            lines_q: queue.Queue = queue.Queue()
+            slot_q = [queue.Queue(), queue.Queue()]
+            miss_once = {"done": False}
+
+            def on_write(line: str, _sent=sent, _lq=lines_q, _sq=slot_q, _mo=miss_once, _mode=mode):
+                _sent.append(line)
+                if "ref=" in line and not _mo["done"]:
+                    _mo["done"] = True
+                    rid = next(tok.split("=")[1] for tok in line.split() if tok.startswith("ref="))
+                    _lq.put(f"REF_MISS {rid}\n")
+                elif line.startswith("BGEN "):
+                    _lq.put("T 888\n")
+                    _lq.put("DONE 1 403 1.0 1.0 stop\n")
+                    _lq.put("BADM 0 0\n")
+                else:
+                    _lq.put("T 888\n")
+                    _lq.put("DONE 1 403 1.0 1.0 stop\n")
+
+            eng = srv.StrataEngine.__new__(srv.StrataEngine)
+            eng.proc = _FakePipeProc(on_write)
+            eng.ended = False
+            eng.batch = 2
+            eng.multi = 0
+            eng.gen = 1
+            eng.can_stop = True
+            eng.silence_s = 0
+            eng.info = {"ipc_delta": 1, "slot_cache": 1}
+            eng.lines = lines_q
+            eng.wlock = threading.Lock()
+            eng.ctl = threading.Lock()
+            eng.slot_cv = threading.Condition()
+            eng.ctl_epoch = 0
+            eng.waiting = 0
+            eng.wait_lens = []
+            eng.arrivals = []
+            eng.admitting = 0
+            eng.slot_order = [0, 1]
+            eng.slot_group = [0, 0]
+            # For 'admit' mode mark slot 1 busy so generate_batched skips solo path and enters BGEN into slot 0
+            eng.slot_busy = [False, mode == "admit"]
+            eng.slot_claims = {1} if mode == "admit" else set()
+            eng.slot_releasing = set()
+            eng.slot_held = [[], []]
+            eng.slot_used = [0.0, 0.0]
+            eng.slot_live = [None, None]
+            eng.slot_q = slot_q
+            eng.last = {}
+            eng._yielded = None
+            eng._ipc_delta = srv.IpcDeltaCodec()
+            eng._ipc_delta_gen = 1
+
+            prompt1 = list(range(500, 900))
+            prompt2 = prompt1 + [901, 902, 903]
+            old_env = os.environ.get("STRATA_IPC_DELTA")
+            try:
+                os.environ["STRATA_IPC_DELTA"] = "1"
+                # Seed ref_id=1
+                eng._ipc_delta.encode(prompt1)
+                cancel = threading.Event()
+                started_calls = {"n": 0}
+                cancel._strata_queue_started = lambda: started_calls.__setitem__("n", started_calls["n"] + 1)
+
+                toks = list(eng.generate_batched(prompt2, 4, {}, cancel))
+                self.assertEqual(toks, [888], f"mode={mode}")
+                self.assertEqual(len(sent), 2, f"mode={mode} should send delta then full retry")
+                self.assertIn("ref=1 keep=400 ", sent[0], f"mode={mode}")
+                failed_sid = int(next(tok.split("=")[1] for tok in sent[0].split() if tok.startswith("ref_save=")))
+                retry_sid = int(next(tok.split("=")[1] for tok in sent[1].split() if tok.startswith("ref_save=")))
+                self.assertNotIn("ref=", sent[1], f"mode={mode}")
+                # Defect A: no phantom save_id retained
+                self.assertNotIn(1, eng._ipc_delta._entries, f"mode={mode}")
+                self.assertNotIn(failed_sid, eng._ipc_delta._entries, f"mode={mode}")
+                self.assertIn(retry_sid, eng._ipc_delta._entries, f"mode={mode}")
+                # Defect B: _strata_queue_started invoked strictly once across retry
+                self.assertEqual(started_calls["n"], 1, f"mode={mode}")
+            finally:
+                if old_env is None:
+                    os.environ.pop("STRATA_IPC_DELTA", None)
+                else:
+                    os.environ["STRATA_IPC_DELTA"] = old_env
 
 
 if __name__ == "__main__":
