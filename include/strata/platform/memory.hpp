@@ -6,6 +6,7 @@
 // only SeIncreaseWorkingSetPrivilege, which ordinary accounts hold). Linux: mlock.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -93,5 +94,29 @@ struct ProcIo {
     uint64_t read_bytes = 0, major_faults = 0;
 };
 ProcIo proc_io_sample();
+
+/// STRATA_CONV_CACHE_NUMA_NODE=N (opt-in, default -1 = off): bind large ConversationBuffer segments (>= 64 KiB)
+/// to NUMA node N via VirtualAllocExNuma (Windows) or mmap + mbind (Linux). Returns -1 when unset, negative,
+/// or out of range for the host topology.
+int conv_cache_numa_node();
+
+/// Available physical RAM on NUMA node `node` in bytes (UINT64_MAX when unavailable or unsupported).
+/// On Windows uses 64-bit GetNumaAvailableMemoryNodeEx (no 32-bit overflow).
+uint64_t numa_node_available_bytes(int node);
+
+/// Allocate `bytes` of anonymous R/W pages preferring NUMA node `node`. Falls back safely if the NUMA hint
+/// cannot be satisfied (setting `fell_back = true`). Always release with numa_free_pages().
+void* numa_alloc_pages(size_t bytes, int node, bool& fell_back);
+void numa_free_pages(void* ptr, size_t bytes) noexcept;
+
+/// Pin the calling thread to the processor group/mask of NUMA node `node` (Windows: GetNumaNodeProcessorMaskEx
+/// + SetThreadGroupAffinity; handles >64-core multi-group EPYC hosts). Returns true if affinity was applied.
+bool pin_thread_to_numa_node(int node);
+
+/// Sample up to `max_samples` 4 KiB pages across [ptr, ptr + bytes) and report how many resident pages reside
+/// on `expected_node` vs another NUMA node (Windows: K32QueryWorkingSetEx, no psapi.lib needed).
+/// Returns false on platforms without per-page NUMA node query.
+bool verify_pages_on_numa_node(const void* ptr, size_t bytes, int expected_node,
+                               size_t& on_node, size_t& off_node, size_t max_samples = 256);
 
 }  // namespace strata::platform

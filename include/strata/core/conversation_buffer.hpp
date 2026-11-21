@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/progress.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -130,11 +132,36 @@ public:
     }
 
 private:
-    // value-initializes only when asked (resize's explicit fill value): resize_for_overwrite leaves the bytes alone
+    // value-initializes only when asked (resize's explicit fill value): resize_for_overwrite leaves the bytes alone.
+    // When STRATA_CONV_CACHE_NUMA_NODE >= 0, allocations >= 64 KiB use VirtualAllocExNuma / mmap+mbind and release
+    // straight back to the OS on deallocate (VirtualFree / munmap), avoiding CRT heap retention and NUMA1 spillover.
     template<class T> struct DefaultInit : std::allocator<T> {
         template<class U> struct rebind { using other = DefaultInit<U>; };
         DefaultInit() = default;
         template<class U> DefaultInit(const DefaultInit<U>&) noexcept {}
+        static constexpr size_t kNumaThreshold = 65536;
+        T* allocate(size_t n) {
+            if (n > SIZE_MAX / sizeof(T)) throw std::bad_alloc();
+            const size_t bytes = n * sizeof(T);
+            const int node = strata::platform::conv_cache_numa_node();
+            if (node >= 0 && bytes >= kNumaThreshold) {
+                bool fell_back = false;
+                void* p = strata::platform::numa_alloc_pages(bytes, node, fell_back);
+                if (p == nullptr) throw std::bad_alloc();
+                return static_cast<T*>(p);
+            }
+            return std::allocator<T>::allocate(n);
+        }
+        void deallocate(T* p, size_t n) noexcept {
+            if (p == nullptr) return;
+            const size_t bytes = n * sizeof(T);
+            const int node = strata::platform::conv_cache_numa_node();
+            if (node >= 0 && bytes >= kNumaThreshold) {
+                strata::platform::numa_free_pages(p, bytes);
+                return;
+            }
+            std::allocator<T>::deallocate(p, n);
+        }
         template<class U> void construct(U* p) { ::new ((void*) p) U; }
         template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
     };

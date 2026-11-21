@@ -824,5 +824,36 @@ int main() {
         check(cache.expire(2800, 1000, &cleared_reuse) == 1 && !cleared_reuse && cache.size() == 0 && cache.bytes() == 0,
               "at t=2800 C expires and total cache bytes reach zero");
     }
+    {
+        // RFC-S3B-A: NUMA page allocator + ConversationBuffer::resize_for_overwrite + QueryWorkingSetEx node verification
+        constexpr size_t kBytes = 4u << 20;   // 4 MiB (>= 64 KiB NUMA threshold)
+        bool fell_back = false;
+        void* raw = strata::platform::numa_alloc_pages(kBytes, 0, fell_back);
+        check(raw != nullptr, "numa_alloc_pages(4 MiB, node=0) succeeds");
+        std::memset(raw, 0x5A, kBytes);
+        size_t on_node = 0, off_node = 0;
+        if (strata::platform::verify_pages_on_numa_node(raw, kBytes, 0, on_node, off_node)) {
+            check(on_node > 0 && (fell_back || off_node == 0),
+                  "QueryWorkingSetEx verifies touched NUMA0 pages reside on node 0");
+            std::printf("numa_alloc_pages self-check: on_node=%zu off_node=%zu fell_back=%d\n",
+                        on_node, off_node, (int) fell_back);
+        }
+        strata::platform::numa_free_pages(raw, kBytes);
+
+        // ConversationBuffer::resize_for_overwrite + full overwrite round-trip (works both with and without STRATA_CONV_CACHE_NUMA_NODE)
+        ConversationBuffer buf;
+        buf.resize_for_overwrite(2u << 20);
+        check(buf.size() == (2u << 20), "resize_for_overwrite sets logical size");
+        check(buf.visit(0, buf.size(), [](uint8_t* p, size_t n, size_t at) {
+            for (size_t i = 0; i < n; ++i) p[i] = (uint8_t) ((at + i) & 0xFFu);
+            return true;
+        }), "visit writes all overwritten bytes");
+        std::vector<uint8_t> out(buf.size(), 0);
+        check(buf.read(out.data(), 0, out.size()), "read back overwritten buffer");
+        bool exact = true;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (out[i] != (uint8_t) (i & 0xFFu)) { exact = false; break; }
+        check(exact, "resize_for_overwrite payload round-trips bitwise exact");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
