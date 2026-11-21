@@ -289,6 +289,19 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
     return conversation_kv_capture_bytes({}, st, g, upto, index, bytes, error) ? bytes : 0;
 }
 
+size_t conversation_kv_device_bytes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index) {
+    Layout l{};
+    std::string error;
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return 0;
+    if (st.kv_mode != 0) return l.pooled;
+    size_t total = 0;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t s : sizes) {
+        if (!conversation_detail::add(total, s)) return 0;
+    }
+    return total;
+}
+
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {

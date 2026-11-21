@@ -12,6 +12,9 @@ namespace strata::core {
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
+// Device-resident portion of conversation_kv_bytes (what STRATA_PARK_ASYNC / STRATA_PARK_VRAM_MIB actually stages
+// in VRAM): all 5 parts when kv_mode == 0; only idx_pooled when kv_mode != 0 (parts 0..3 live in st.host.*).
+size_t conversation_kv_device_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
 // A nonzero unchanged_tokens is valid only for storage retained from an image
 // actually restored into this session, bounded by every subsequent rewrite.
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
