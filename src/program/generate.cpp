@@ -1374,6 +1374,40 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
+// 64-bit little-endian prefix digest for STRATA_IPC_DELTA: ((uint64_t)crc32 << 32) | adler32.
+// Matches Python's zlib.crc32 + zlib.adler32 over little-endian int32 bytes bit-for-bit.
+uint64_t ipc_digest_i32(const int32_t* data, size_t n) {
+    static const auto crc_tab = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            t[i] = c;
+        }
+        return t;
+    }();
+    uint32_t crc = 0xFFFFFFFFu;
+    uint32_t a = 1u, b = 0u;
+    constexpr uint32_t kMod = 65521u;
+    size_t run = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t v = (uint32_t) data[i];
+        const uint8_t bytes[4] = {
+            (uint8_t) (v & 0xFFu), (uint8_t) ((v >> 8) & 0xFFu),
+            (uint8_t) ((v >> 16) & 0xFFu), (uint8_t) ((v >> 24) & 0xFFu)
+        };
+        for (int j = 0; j < 4; ++j) {
+            crc = crc_tab[(crc ^ bytes[j]) & 0xFFu] ^ (crc >> 8);
+            a += bytes[j];
+            b += a;
+        }
+        if (++run == 1024) { a %= kMod; b %= kMod; run = 0; }
+    }
+    if (run > 0) { a %= kMod; b %= kMod; }
+    crc ^= 0xFFFFFFFFu;
+    return ((uint64_t) crc << 32) | (uint64_t) ((b << 16) | a);
+}
+
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
 struct Drive {
     strata::core::ExpertDispatch d;
@@ -13353,7 +13387,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s ipc_delta=1 engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -14828,6 +14862,15 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // STRATA_IPC_DELTA (RFC-S2A-2): 16-slot LRU prompt token ref cache (pure text delta IPC: ref/keep/h/ref_save).
+        // Zero overhead when the client does not send ref=/ref_save= keys.
+        struct IpcPromptRef {
+            uint64_t id = 0;
+            std::vector<int32_t> ids;
+        };
+        constexpr size_t kIpcRefSlots = 16;
+        std::vector<IpcPromptRef> ipc_refs;
+        ipc_refs.reserve(kIpcRefSlots);
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -15249,6 +15292,9 @@ int main(int argc, char** argv) {
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
+            uint64_t req_ref_id = 0, req_ref_hash = 0, req_ref_save = 0;
+            int64_t req_ref_keep = -1;
+            bool req_ref_set = false, req_ref_hash_set = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -15305,6 +15351,14 @@ int main(int argc, char** argv) {
                             if (*qe != ',' && *qe != '\0') { req_img_keys.clear(); break; }
                         }
                     }
+                    else if (key == "ref") { req_ref_id = std::strtoull(tok.c_str() + eq + 1, nullptr, 10); req_ref_set = true; }
+                    else if (key == "keep") req_ref_keep = std::atoll(tok.c_str() + eq + 1);
+                    else if (key == "h") {
+                        char* he = nullptr;
+                        req_ref_hash = std::strtoull(tok.c_str() + eq + 1, &he, 16);
+                        req_ref_hash_set = he != nullptr && he != tok.c_str() + eq + 1 && *he == '\0';
+                    }
+                    else if (key == "ref_save") req_ref_save = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -15324,10 +15378,63 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if ((max_new < 1 && !(max_new == 0 && req_prefill_only)) || (req_prefill_only && max_new != 0) || endp == nullptr ||
-                (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
+            const bool req_head_bad = (max_new < 1 && !(max_new == 0 && req_prefill_only)) ||
+                                      (req_prefill_only && max_new != 0) || endp == nullptr ||
+                                      (geni && emb_path.empty());
+            if (!req_head_bad && req_ref_set) {
+                auto it = std::find_if(ipc_refs.begin(), ipc_refs.end(),
+                                       [&](const IpcPromptRef& r) { return r.id == req_ref_id; });
+                const bool hit = it != ipc_refs.end() && req_ref_keep >= 0 &&
+                                 (size_t) req_ref_keep <= it->ids.size() && req_ref_hash_set &&
+                                 ipc_digest_i32(it->ids.data(), (size_t) req_ref_keep) == req_ref_hash;
+                if (!hit) {
+                    if (admit_slot >= 0 && !co_set.empty()) co_pending = std::move(co_set);
+                    admit_slot = -1;
+                    std::printf("REF_MISS %llu\n", (unsigned long long) req_ref_id);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (it + 1 != ipc_refs.end()) {
+                    IpcPromptRef hit_entry = std::move(*it);
+                    ipc_refs.erase(it);
+                    ipc_refs.push_back(std::move(hit_entry));
+                    it = ipc_refs.end() - 1;
+                }
+                const char* dp = endp;
+                while (*dp == ' ') ++dp;
+                std::vector<int64_t> delta_ids;
+                bool delta_ok = true;
+                if (*dp == '-' && (dp[1] == '\0' || dp[1] == ' ' || dp[1] == '\r' || dp[1] == '\n')) {
+                    // Empty delta: exact prefix match (keep == full prompt length)
+                } else {
+                    delta_ok = parse_i64_list(dp, delta_ids, pe);
+                }
+                if (!delta_ok) {
+                    std::printf("ERR bad request: %s\n", pe.empty() ? "delta" : pe.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                ids.reserve((size_t) req_ref_keep + delta_ids.size());
+                for (int64_t k = 0; k < req_ref_keep; ++k) ids.push_back((int64_t) it->ids[(size_t) k]);
+                ids.insert(ids.end(), delta_ids.begin(), delta_ids.end());
+                if (ids.empty()) {
+                    std::printf("ERR bad request: token list was empty\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+            } else if (req_head_bad || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
+                std::fflush(stdout);
                 continue;
+            }
+            if (req_ref_save > 0 && !ids.empty()) {
+                std::vector<int32_t> saved(ids.size());
+                for (size_t i = 0; i < ids.size(); ++i) saved[i] = (int32_t) ids[i];
+                auto it = std::find_if(ipc_refs.begin(), ipc_refs.end(),
+                                       [&](const IpcPromptRef& r) { return r.id == req_ref_save; });
+                if (it != ipc_refs.end()) ipc_refs.erase(it);
+                else if (ipc_refs.size() >= kIpcRefSlots) ipc_refs.erase(ipc_refs.begin());
+                ipc_refs.push_back({req_ref_save, std::move(saved)});
             }
             const int64_t n = (int64_t) ids.size();
             // --draft auto: this request's drafter.  Without the DFlash2 drafter loaded every request uses the MTP, as before.
