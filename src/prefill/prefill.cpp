@@ -1245,8 +1245,9 @@ namespace {
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 // RFC-K3-A (opt-in, default OFF): STRATA_PREFILL_SPARSE_KV=1 skips the full-prefix kv_stage_from_host copy for chunks
-// up to STRATA_PREFILL_SPARSE_MAX_T (default 768, strictly < stream_all_min()=1024) and runs selection-first sparse
-// kv_stream_resolve in pigeonhole zero-overflow sub-batches directly into the session's resident VRAM KV pool.
+// up to STRATA_PREFILL_SPARSE_MAX_T (default 256, empirical A6000 crossover where pigeonhole sub-batching beats full
+// staging; >256 stays on staged + RFC-K3-B zero-borrow) and runs selection-first sparse kv_stream_resolve in
+// pigeonhole zero-overflow sub-batches directly into the session's resident VRAM KV pool.
 bool sparse_kv_on() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_PREFILL_SPARSE_KV");
@@ -1257,8 +1258,8 @@ bool sparse_kv_on() {
 int64_t sparse_kv_max_t() {
     static const int64_t v = [] {
         const char* e = std::getenv("STRATA_PREFILL_SPARSE_MAX_T");
-        const long long n = e != nullptr ? std::atoll(e) : 768;
-        return n >= 1 ? (int64_t) n : (int64_t) 768;
+        const long long n = e != nullptr ? std::atoll(e) : 256;
+        return n >= 1 ? (int64_t) n : (int64_t) 256;
     }();
     return v;
 }
@@ -4467,24 +4468,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t attn_h_stride = ld_a > 0 ? ld_a : ZV;
                         bool used_gated = false;
                         bool logged_sub = false;
+                        // STRATA_PREFILL_SPARSE_CHECK=1: compare monotonic st.map.ctl[3] overflow_count before vs after
+                        // this layer's sub-batch loop so prior sticky decode overflow (e.g. --kv-resident 4096 --spec 4)
+                        // never causes false-positive prefill errors and per-sub-batch WDDM sync distortion is avoided.
+                        uint32_t ovf_before = 0;
+                        if (sparse_kv_check_on()) {
+                            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                                err = "prefill: sparse KV pre-check stream sync failed at layer " + std::to_string(l);
+                                return false;
+                            }
+                            ovf_before = strata::kernels::kv_stream_counters(st.map).overflow_count;
+                        }
                         for (int64_t t0 = 0; t0 < T; t0 += sub_b) {
                             const int64_t nb = std::min(sub_b, T - t0);
                             pt.mark(kPfKvStage, cs);
                             core::qsa_kv_resolve(st, g, m.sel_ids + t0 * m.cap,
                                                  m.steps_dev + t0 * strata::kernels::kStepCount, nb, m.cap, m.cs);
-                            if (sparse_kv_check_on()) {
-                                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                                    err = "prefill: sparse KV resolve stream sync failed at layer " + std::to_string(l);
-                                    return false;
-                                }
-                                const strata::kernels::KvStreamCounters kc = strata::kernels::kv_stream_counters(st.map);
-                                if (kc.overflow) {
-                                    err = "prefill: sparse KV resolve overflowed resident slots at layer " +
-                                          std::to_string(l) + " (sub_b=" + std::to_string(sub_b) +
-                                          ", n_slots=" + std::to_string(st.n_slots) + ")";
-                                    return false;
-                                }
-                            }
                             pt.mark(kPfQsaAttn, cs);
                             const bool sub_gated = try_gated &&
                                                    strata::kernels::qsa_prompt_attn_batch_gated(
@@ -4529,6 +4528,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (used_gated)
                                     gate_attn(m.attn + t0 * ZV, m.Qf + t0 * (2 * ZV), m.attn_h + t0 * attn_h_stride,
                                               nb, m.cs, ld_a);
+                            }
+                        }
+                        if (sparse_kv_check_on()) {
+                            pt.mark(kPfQsa, cs);
+                            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                                err = "prefill: sparse KV resolve stream sync failed at layer " + std::to_string(l);
+                                return false;
+                            }
+                            const strata::kernels::KvStreamCounters kc = strata::kernels::kv_stream_counters(st.map);
+                            if (kc.overflow_count != ovf_before) {
+                                err = "prefill: sparse KV resolve overflowed resident slots at layer " +
+                                      std::to_string(l) + " (sub_b=" + std::to_string(sub_b) +
+                                      ", n_slots=" + std::to_string(st.n_slots) +
+                                      ", ovf_delta=" + std::to_string(kc.overflow_count - ovf_before) + ")";
+                                return false;
                             }
                         }
                         gated = used_gated;

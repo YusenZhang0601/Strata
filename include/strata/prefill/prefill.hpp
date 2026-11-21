@@ -89,7 +89,7 @@ public:
     int64_t chunk() const;
 
     /// RFC-K3-A (opt-in, default OFF): STRATA_PREFILL_SPARSE_KV=1 skips full-prefix `kv_stage_from_host` for chunks up
-    /// to `sparse_kv_max_tokens()` (STRATA_PREFILL_SPARSE_MAX_T, default 768) and resolves only selected blocks in
+    /// to `sparse_kv_max_tokens()` (STRATA_PREFILL_SPARSE_MAX_T, default 256) and resolves only selected blocks in
     /// pigeonhole zero-overflow sub-batches directly into the session's resident VRAM KV pool.
     static bool sparse_kv_enabled();
     static int64_t sparse_kv_max_tokens();
