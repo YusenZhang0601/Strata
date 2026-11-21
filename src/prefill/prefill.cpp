@@ -2146,13 +2146,16 @@ int64_t Prefill::sparse_kv_max_tokens() { return sparse_kv_max_t(); }
 bool Prefill::sparse_kv_supported(const core::ModelGeometry& g, const core::SessionState& ss) {
     if (!sparse_kv_on()) return false;
     const strata::kernels::QsaShapes s = core::qsa_shapes(g);
+    if (s.page_size != s.idx_block) return false;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_pages_per_q = (cap + s.page_size - 1) / s.page_size + 1;
+    // kv_stream.cu requires m.n_slots >= RT (1024) as well as >= max_pages_per_q for zero-overflow sub-batching.
+    const int64_t min_slots = std::max<int64_t>(max_pages_per_q, 1024);
     bool any_streamed = false;
     for (const core::QsaState& st : ss.qsa_states) {
         if (st.kv_mode != 1) continue;
         any_streamed = true;
-        if (st.n_slots < max_pages_per_q || st.map.page_table == nullptr || st.map.ctl == nullptr ||
+        if (st.n_slots < min_slots || st.map.page_table == nullptr || st.map.ctl == nullptr ||
             !st.host.present())
             return false;
     }
@@ -4221,9 +4224,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // RFC-K3-A (sparse_kv): skip full-prefix staging here; kv_append writes st.host (and resident VRAM
                     // slots), and after top-k selection qsa_kv_resolve brings only the selected pages into VRAM.
                     const int64_t max_pages_per_q = (m.cap + s.page_size - 1) / s.page_size + 1;
-                    const bool sparse_kv = chunk_sparse_kv && !kva_state_only && st.kv_mode == 1 &&
-                                           st.n_slots >= max_pages_per_q && st.map.page_table != nullptr &&
-                                           st.map.ctl != nullptr && st.host.present();
+                    const int64_t min_sparse_slots = std::max<int64_t>(max_pages_per_q, 1024);
+                    const bool sparse_kv = chunk_sparse_kv && !kva_state_only && s.page_size == s.idx_block &&
+                                           st.kv_mode == 1 && st.n_slots >= min_sparse_slots &&
+                                           st.map.page_table != nullptr && st.map.ctl != nullptr && st.host.present();
                     const bool staged = st.kv_mode == 1 && !sparse_kv && !(kva_state_only && m.no_kv_stage);
                     if (staged && !m.stage.present()) {
                         err = "prefill: KV staging pool missing for staged QSA layer " + std::to_string(l);
