@@ -7,6 +7,15 @@
   "release_tag_commit": "ffa80d73133ea5c548aefe57889a16e8085a938f",
   "tag_relation": "base_commit is an ancestor of release_tag, 69 commits earlier. In that range the engine sources change only under src/dsv41 (the separate strata-dsv41 executable), src/split (built by its own src/split/CMakeLists.txt, which the root CMakeLists.txt does not reference), metal/ (the Metal build) and third_party/antirez-ds4; the CUDA strata target's sources are identical",
   "ggml_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "current_release": {
+    "tag": "personal-0.1.56-p2",
+    "built_commit": "a1c2c904139d5c6a028750141d7a75f35253b76a",
+    "released_on": "2026-11-22",
+    "artifacts": {
+      "strata.exe": "9ca1348a2ea895294b80cf0ee882a50273f31c16c5feaffd903d5c5c502baa17",
+      "strata_kq.dll": "a95954c3a626122c3590b3748c467e268edf752375b344fccaee73657f9b62f8"
+    }
+  },
   "reviewed_upstream": {
     "ref": "main",
     "commit": "13eedf552417a6a791a7d13c6597e24300ee3a09",

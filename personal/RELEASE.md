@@ -234,8 +234,11 @@ regenerated at the next join.
 ```
 
 The p1 file predates this schema. Its `branch` and "not pushed" fields are stale: the source was pushed after the
-deployment, and the release now lives on `personal/stable`. Its commit, hashes and toolchain are correct. The next
-release writes schema 2.
+deployment, and the release now lives on `personal/stable`. Its commit, hashes and toolchain are correct. From
+`personal-0.1.56-p2` onward, releases write schema 2 and keep all new optimization switches opt-in (default OFF) while
+enforcing the release guardrails listed in `personal/README.md` (leave `STRATA_BATCH_MTP_ATTN_SLOTS` unset, keep
+`STRATA_PREFILL_SPARSE_CHECK=0`, and pair `STRATA_CONV_CACHE_NUMA_NODE=0` with `STRATA_CONV_CACHE_TTL_S` and bounded
+conversation cache slots).
 
 ## Rollback
 
